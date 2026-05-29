@@ -110,7 +110,8 @@ class QCNetAgentEncoder(nn.Module):
             ]
         else:
             raise ValueError('{} is not a valid dataset'.format(self.dataset))
-
+        
+        #agent初始特征的傅里叶嵌入 x_a
         if self.dataset == 'argoverse_v2':
             x_a = torch.stack(
                 [torch.norm(motion_vector_a[:, :, :2], p=2, dim=-1),
@@ -122,6 +123,8 @@ class QCNetAgentEncoder(nn.Module):
         x_a = self.x_a_emb(continuous_inputs=x_a.view(-1, x_a.size(-1)), categorical_embs=categorical_embs)
         x_a = x_a.view(-1, self.num_historical_steps, self.hidden_dim)
 
+        #agent时间步相对位置编码 r_t
+        #按agent编号顺序
         pos_t = pos_a.reshape(-1, self.input_dim)
         head_t = head_a.reshape(-1)
         head_vector_t = head_vector_a.reshape(-1, 2)
@@ -136,8 +139,10 @@ class QCNetAgentEncoder(nn.Module):
              angle_between_2d_vectors(ctr_vector=head_vector_t[edge_index_t[1]], nbr_vector=rel_pos_t[:, :2]),
              rel_head_t,
              edge_index_t[0] - edge_index_t[1]], dim=-1)
-        r_t = self.r_t_emb(continuous_inputs=r_t, categorical_embs=None)
+        r_t = self.r_t_emb(continuous_inputs=r_t, categorical_embs=None) 
 
+        #agent-polygon相对位置编码 r_pl2a
+        #按时间步编号分组顺序
         pos_s = pos_a.transpose(0, 1).reshape(-1, self.input_dim)
         head_s = head_a.transpose(0, 1).reshape(-1)
         head_vector_s = head_vector_a.transpose(0, 1).reshape(-1, 2)
@@ -154,8 +159,8 @@ class QCNetAgentEncoder(nn.Module):
                                    device=pos_a.device).repeat_interleave(data['agent']['num_nodes'])
             batch_pl = torch.arange(self.num_historical_steps,
                                     device=pos_pl.device).repeat_interleave(data['map_polygon']['num_nodes'])
-        edge_index_pl2a = radius(x=pos_s[:, :2], y=pos_pl[:, :2], r=self.pl2a_radius, batch_x=batch_s, batch_y=batch_pl,
-                                 max_num_neighbors=300)
+        edge_index_pl2a = radius(x=pos_s[:, :2], y=pos_pl[:, :2], r=self.pl2a_radius, batch_x=batch_s, batch_y=batch_pl, 
+                                 max_num_neighbors=200)
         edge_index_pl2a = edge_index_pl2a[:, mask_s[edge_index_pl2a[1]]]
         rel_pos_pl2a = pos_pl[edge_index_pl2a[0]] - pos_s[edge_index_pl2a[1]]
         rel_orient_pl2a = wrap_angle(orient_pl[edge_index_pl2a[0]] - head_s[edge_index_pl2a[1]])
@@ -163,9 +168,12 @@ class QCNetAgentEncoder(nn.Module):
             [torch.norm(rel_pos_pl2a[:, :2], p=2, dim=-1),
              angle_between_2d_vectors(ctr_vector=head_vector_s[edge_index_pl2a[1]], nbr_vector=rel_pos_pl2a[:, :2]),
              rel_orient_pl2a], dim=-1)
-        r_pl2a = self.r_pl2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
+        r_pl2a = self.r_pl2a_emb(continuous_inputs=r_pl2a, categorical_embs=None) 
+
+        #agent-agent相对位置编码 r_a2a
+        #按时间步顺序
         edge_index_a2a = radius_graph(x=pos_s[:, :2], r=self.a2a_radius, batch=batch_s, loop=False,
-                                      max_num_neighbors=300)
+                                      max_num_neighbors=200)
         edge_index_a2a = subgraph(subset=mask_s, edge_index=edge_index_a2a)[0]
         rel_pos_a2a = pos_s[edge_index_a2a[0]] - pos_s[edge_index_a2a[1]]
         rel_head_a2a = wrap_angle(head_s[edge_index_a2a[0]] - head_s[edge_index_a2a[1]])
@@ -175,6 +183,7 @@ class QCNetAgentEncoder(nn.Module):
              rel_head_a2a], dim=-1)
         r_a2a = self.r_a2a_emb(continuous_inputs=r_a2a, categorical_embs=None)
 
+        #agent分解注意力聚合特征
         for i in range(self.num_layers):
             x_a = x_a.reshape(-1, self.hidden_dim)
             x_a = self.t_attn_layers[i](x_a, r_t, edge_index_t)
@@ -185,4 +194,4 @@ class QCNetAgentEncoder(nn.Module):
             x_a = self.a2a_attn_layers[i](x_a, r_a2a, edge_index_a2a)
             x_a = x_a.reshape(self.num_historical_steps, -1, self.hidden_dim).transpose(0, 1)
 
-        return {'x_a': x_a}
+        return {'x_a': x_a} #智能体数*时间步数*隐藏维度

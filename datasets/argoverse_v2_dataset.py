@@ -132,7 +132,7 @@ class ArgoverseV2Dataset(Dataset):
         self.vector_repr = vector_repr
         self._url = f'https://s3.amazonaws.com/argoverse/datasets/av2/tars/motion-forecasting/{split}.tar'
         self._num_samples = {
-            'train': 199908,
+            'train': 199707,
             'val': 24988,
             'test': 24984,
         }[split]
@@ -180,12 +180,26 @@ class ArgoverseV2Dataset(Dataset):
         for raw_file_name in self.raw_file_names:
             shutil.move(os.path.join(self.raw_dir, self.split, raw_file_name), self.raw_dir)
         os.rmdir(os.path.join(self.raw_dir, self.split))
+        pass
 
     def process(self) -> None:
         for raw_file_name in tqdm(self.raw_file_names):
             df = pd.read_parquet(os.path.join(self.raw_dir, raw_file_name, f'scenario_{raw_file_name}.parquet'))
             map_dir = Path(self.raw_dir) / raw_file_name
-            map_path = map_dir / sorted(map_dir.glob('log_map_archive_*.json'))[0]
+            # === 调试代码开始 ===
+            map_files = sorted(map_dir.glob('log_map_archive_*.json'))
+
+            if len(map_files) == 0:
+                print(f"\n{'='*40}")
+                print(f"[严重错误] 找到损坏的数据文件夹！")
+                print(f"[路径] {map_dir}")
+                print(f"{'='*40}\n")
+                # 这里我们手动抛出一个具体的错误，强制程序停止，防止出现 No active exception 错误
+                raise FileNotFoundError(f"Missing map file in {map_dir}")
+
+            map_path = map_dir / map_files[0]
+            # === 调试代码结束 ===
+            #map_path = map_dir / sorted(map_dir.glob('log_map_archive_*.json'))[0]
             map_data = read_json_file(map_path)
             centerlines = {lane_segment['id']: Polyline.from_json_data(lane_segment['centerline'])
                            for lane_segment in map_data['lane_segments'].values()}
@@ -511,12 +525,13 @@ class ArgoverseV2Dataset(Dataset):
             return HeteroData(pickle.load(handle))
 
     def _download(self) -> None:
-        # if complete raw/processed files exist, skip downloading
+        #if complete raw/processed files exist, skip downloading
         if ((os.path.isdir(self.raw_dir) and len(self.raw_file_names) == len(self)) or
                 (os.path.isdir(self.processed_dir) and len(self.processed_file_names) == len(self))):
             return
         self._processed_file_names = []
         self.download()
+        pass
 
     def _process(self) -> None:
         # if complete processed files exist, skip processing

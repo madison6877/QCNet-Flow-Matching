@@ -148,12 +148,13 @@ class QCNetDecoder(nn.Module):
         x_t = scene_enc['x_a'].reshape(-1, self.hidden_dim)
         x_pl = scene_enc['x_pl'][:, self.num_historical_steps - 1].repeat(self.num_modes, 1)
         x_a = scene_enc['x_a'][:, -1].repeat(self.num_modes, 1)
-        m = self.mode_emb.weight.repeat(scene_enc['x_a'].size(0), 1)
+        m = self.mode_emb.weight.repeat(scene_enc['x_a'].size(0), 1) #把query整体重复anegnt个数次
 
         mask_src = data['agent']['valid_mask'][:, :self.num_historical_steps].contiguous()
         mask_src[:, :self.num_historical_steps - self.num_t2m_steps] = False
         mask_dst = data['agent']['predict_mask'].any(dim=-1, keepdim=True).repeat(1, self.num_modes)
 
+        #模态到时间步的相对位置编码
         pos_t = data['agent']['position'][:, :self.num_historical_steps, :self.input_dim].reshape(-1, self.input_dim)
         head_t = data['agent']['heading'][:, :self.num_historical_steps].reshape(-1)
         edge_index_t2m = bipartite_dense_to_sparse(mask_src.unsqueeze(2) & mask_dst[:, -1:].unsqueeze(1))
@@ -168,6 +169,7 @@ class QCNetDecoder(nn.Module):
         edge_index_t2m = bipartite_dense_to_sparse(mask_src.unsqueeze(2) & mask_dst.unsqueeze(1))
         r_t2m = r_t2m.repeat_interleave(repeats=self.num_modes, dim=0)
 
+        #模态到相邻polygon的相对位置编码
         pos_pl = data['map_polygon']['position'][:, :self.input_dim]
         orient_pl = data['map_polygon']['orientation']
         edge_index_pl2m = radius(
@@ -189,6 +191,7 @@ class QCNetDecoder(nn.Module):
             [[data['map_polygon']['num_nodes']], [data['agent']['num_nodes']]]) for i in range(self.num_modes)], dim=1)
         r_pl2m = r_pl2m.repeat(self.num_modes, 1)
 
+        #模态到相邻agent的相对位置编码
         edge_index_a2m = radius_graph(
             x=pos_m[:, :2],
             r=self.a2m_radius,

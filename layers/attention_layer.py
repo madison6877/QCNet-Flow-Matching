@@ -20,6 +20,9 @@ from torch_geometric.utils import softmax
 
 from utils import weight_init
 
+# === 新增这行 ===
+from torch.utils.checkpoint import checkpoint
+
 
 class AttentionLayer(MessagePassing):
 
@@ -81,6 +84,18 @@ class AttentionLayer(MessagePassing):
             r = self.attn_prenorm_r(r)
         x = x + self.attn_postnorm(self._attn_block(x_src, x_dst, r, edge_index))
         x = x + self.ff_postnorm(self._ff_block(self.ff_prenorm(x)))
+
+        # # === 修改开始 ===
+        # # 使用 checkpoint 包裹 _attn_block (注意力计算)
+        # # use_reentrant=False 是推荐的新版写法，更安全
+        # attn_out = checkpoint(self._attn_block, x_src, x_dst, r, edge_index, use_reentrant=False)
+        # x = x + self.attn_postnorm(attn_out)
+
+        # # 使用 checkpoint 包裹 _ff_block (前馈网络)
+        # ff_in = self.ff_prenorm(x)
+        # ff_out = checkpoint(self._ff_block, ff_in, use_reentrant=False)
+        # x = x + self.ff_postnorm(ff_out)
+        # # === 修改结束 ===
         return x
 
     def message(self,

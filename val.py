@@ -17,7 +17,7 @@ import pytorch_lightning as pl
 from torch_geometric.loader import DataLoader
 
 from datasets import ArgoverseV2Dataset
-from predictors import QCNet
+from predictors import QCNet, QCNetFM
 from transforms import TargetBuilder
 
 if __name__ == '__main__':
@@ -37,6 +37,7 @@ if __name__ == '__main__':
 
     model = {
         'QCNet': QCNet,
+        'QCNetFM': QCNetFM,
     }[args.model].load_from_checkpoint(checkpoint_path=args.ckpt_path)
     val_dataset = {
         'argoverse_v2': ArgoverseV2Dataset,
@@ -44,5 +45,5 @@ if __name__ == '__main__':
                      transform=TargetBuilder(model.num_historical_steps, model.num_future_steps))
     dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
                             pin_memory=args.pin_memory, persistent_workers=args.persistent_workers)
-    trainer = pl.Trainer(accelerator=args.accelerator, devices=args.devices, strategy='ddp')
+    trainer = pl.Trainer(accelerator=args.accelerator, devices=args.devices, strategy='ddp', precision='bf16-mixed')
     trainer.validate(model, dataloader)

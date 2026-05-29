@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from losses.flow_matching_loss import FlowMatchingLoss
 from losses.focal_loss import FocalLoss
 from losses.gaussian_nll_loss import GaussianNLLLoss
 from losses.laplace_nll_loss import LaplaceNLLLoss

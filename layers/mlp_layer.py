@@ -16,6 +16,7 @@ import torch.nn as nn
 
 from utils import weight_init
 
+from torch.utils.checkpoint import checkpoint
 
 class MLPLayer(nn.Module):
 
@@ -34,3 +35,8 @@ class MLPLayer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.mlp(x)
+
+    # def forward(self, x: torch.Tensor) -> torch.Tensor:
+    #     # 修改前: return self.mlp(x)
+    #     # 修改后:
+    #     return checkpoint(self.mlp, x, use_reentrant=False)

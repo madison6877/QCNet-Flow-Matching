@@ -99,6 +99,7 @@ class QCNetMapEncoder(nn.Module):
         orient_pl = data['map_polygon']['orientation'].contiguous()
         orient_vector_pl = torch.stack([orient_pl.cos(), orient_pl.sin()], dim=-1)
 
+        #pt与pl初始特征的傅里叶嵌入 x_pt x_pl
         if self.dataset == 'argoverse_v2':
             if self.input_dim == 2:
                 x_pt = data['map_point']['magnitude'].unsqueeze(-1)
@@ -117,6 +118,7 @@ class QCNetMapEncoder(nn.Module):
         x_pt = self.x_pt_emb(continuous_inputs=x_pt, categorical_embs=x_pt_categorical_embs)
         x_pl = self.x_pl_emb(continuous_inputs=x_pl, categorical_embs=x_pl_categorical_embs)
 
+        #pt与其所属pl的相对位置编码 r_pt2pl
         edge_index_pt2pl = data['map_point', 'to', 'map_polygon']['edge_index']
         rel_pos_pt2pl = pos_pt[edge_index_pt2pl[0]] - pos_pl[edge_index_pt2pl[1]]
         rel_orient_pt2pl = wrap_angle(orient_pt[edge_index_pt2pl[0]] - orient_pl[edge_index_pt2pl[1]])
@@ -137,10 +139,19 @@ class QCNetMapEncoder(nn.Module):
             raise ValueError('{} is not a valid dimension'.format(self.input_dim))
         r_pt2pl = self.r_pt2pl_emb(continuous_inputs=r_pt2pl, categorical_embs=None)
 
+        #pl与pl的相对位置编码 r_pl2pl
         edge_index_pl2pl = data['map_polygon', 'to', 'map_polygon']['edge_index']
-        edge_index_pl2pl_radius = radius_graph(x=pos_pl[:, :2], r=self.pl2pl_radius,
-                                               batch=data['map_polygon']['batch'] if isinstance(data, Batch) else None,
-                                               loop=False, max_num_neighbors=300)
+       # ========== 提取数据，你的原代码 ==========
+        pos_pl_2d = pos_pl[:, :2]
+        batch_pl = data['map_polygon']['batch']
+
+        # ========== 终极安全校验逻辑【根治空张量CUDA断言错误，核心修改！】 ==========
+        # 优先判断：张量是否为空 + 张量是否有效，永远不执行空张量的.max()
+        if pos_pl_2d.shape[0] == 0 or len(batch_pl) == 0 or (len(batch_pl) > 0 and batch_pl.max() < 0):
+            edge_index_pl2pl_radius = torch.tensor([[], []], dtype=torch.long, device=pos_pl.device)
+        else:
+            edge_index_pl2pl_radius = radius_graph(x=pos_pl_2d, r=self.pl2pl_radius,
+                                           batch=batch_pl, loop=False, max_num_neighbors=200)
         type_pl2pl = data['map_polygon', 'to', 'map_polygon']['type']
         type_pl2pl_radius = type_pl2pl.new_zeros(edge_index_pl2pl_radius.size(1), dtype=torch.uint8)
         edge_index_pl2pl, type_pl2pl = merge_edges(edge_indices=[edge_index_pl2pl_radius, edge_index_pl2pl],
@@ -164,10 +175,11 @@ class QCNetMapEncoder(nn.Module):
             raise ValueError('{} is not a valid dimension'.format(self.input_dim))
         r_pl2pl = self.r_pl2pl_emb(continuous_inputs=r_pl2pl, categorical_embs=[self.type_pl2pl_emb(type_pl2pl.long())])
 
+        #pt->pl->pl特征融合
         for i in range(self.num_layers):
             x_pl = self.pt2pl_layers[i]((x_pt, x_pl), r_pt2pl, edge_index_pt2pl)
             x_pl = self.pl2pl_layers[i](x_pl, r_pl2pl, edge_index_pl2pl)
         x_pl = x_pl.repeat_interleave(repeats=self.num_historical_steps,
                                       dim=0).reshape(-1, self.num_historical_steps, self.hidden_dim)
 
-        return {'x_pt': x_pt, 'x_pl': x_pl}
+        return {'x_pt': x_pt, 'x_pl': x_pl} #x_pt:点特征（点数*隐藏维度） x_pl:面特征（面数*时间步数*隐藏维度）

@@ -19,6 +19,8 @@ import torch.nn as nn
 
 from utils import weight_init
 
+from torch.utils.checkpoint import checkpoint
+
 
 class FourierEmbedding(nn.Module):
 
