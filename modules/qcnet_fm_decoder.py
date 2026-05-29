@@ -58,7 +58,7 @@ class TrajectoryScorer(nn.Module):
         traj = self.traj_proj(trajectories)               # [N_a, K, T_f, hidden_dim]
         traj = traj.reshape(N_a * K, T_f, self.hidden_dim).transpose(0, 1).contiguous()
         h0 = self.traj_encoder_h0.unsqueeze(1).expand(1, traj.size(1), self.hidden_dim).contiguous()
-        traj_feat = self.traj_encoder(traj, h0)[1].squeeze(0)
+        traj_feat = self.traj_encoder(traj, h0)[1].squeeze(0).reshape(N_a, K, self.hidden_dim)
 
         # Expand agent context to match K modes
         ctx_exp = agent_context.unsqueeze(1).expand(-1, K, -1)  # [N_a, K, hidden_dim]
