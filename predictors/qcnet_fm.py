@@ -25,6 +25,7 @@ from torch_geometric.data import Batch
 from torch_geometric.data import HeteroData
 
 from losses import FlowMatchingLoss
+from losses import VAELoss
 from metrics import Brier
 from metrics import MR
 from metrics import minADE
@@ -33,6 +34,7 @@ from metrics import minFDE
 from metrics import minFHE
 from modules import QCNetEncoder
 from modules import QCNetFMDecoder
+from modules import LatentSpaceEncoder
 
 try:
     from av2.datasets.motion_forecasting.eval.submission import ChallengeSubmission
@@ -71,6 +73,11 @@ class QCNetFM(pl.LightningModule):
                  T_max: int,
                  submission_dir: str,
                  submission_file_name: str,
+                 vae_only: bool = False,
+                 freeze_vae: bool = False,
+                 vae_beta: float = 0.1,
+                 vae_gamma: float = 3.0,
+                 vae_num_intents: int = 3,
                  **kwargs) -> None:
         super(QCNetFM, self).__init__()
         self.save_hyperparameters()
@@ -97,6 +104,11 @@ class QCNetFM(pl.LightningModule):
         self.a2m_radius = a2m_radius
         self.fm_num_steps = fm_num_steps
         self.scorer_only = scorer_only
+        self.vae_only = vae_only
+        self.freeze_vae = freeze_vae
+        self.vae_beta = vae_beta
+        self.vae_gamma = vae_gamma
+        self.vae_num_intents = vae_num_intents
         self.lr = lr
         self.weight_decay = weight_decay
         self.T_max = T_max
@@ -138,6 +150,14 @@ class QCNetFM(pl.LightningModule):
 
         self.fm_loss = FlowMatchingLoss(reduction='none')
 
+        self.latent_encoder = LatentSpaceEncoder(
+            hidden_dim=hidden_dim,
+            input_dim=output_dim,
+            num_future_steps=num_future_steps,
+            num_intents=vae_num_intents,
+        )
+        self.vae_loss = VAELoss(beta=vae_beta, gamma=vae_gamma)
+
         self.minADE = minADE(max_guesses=6)
         self.minAHE = minAHE(max_guesses=6)
         self.minFDE = minFDE(max_guesses=6)
@@ -150,9 +170,24 @@ class QCNetFM(pl.LightningModule):
         v_theta = self.fm_decoder(data, scene_enc, x_t, t)
         return v_theta
 
+    # def train_dataloader(self):
+    #     """Override default DataLoader for VAE-only training.
+
+    #     When vae_only=True, returns the lightweight VAE DataLoader (tiny .pt files)
+    #     instead of the full HeteroData DataLoader.  This bypasses the heavy .pkl
+    #     deserialization + TargetBuilder CPU bottleneck.
+    #     """
+    #     if self.vae_only:
+    #         return self.trainer.datamodule.vae_train_dataloader()
+    #     return super().train_dataloader()
+
     def training_step(self, data, batch_idx):
+
         if isinstance(data, Batch):
             data['agent']['av_index'] += data['agent']['ptr'][:-1]
+
+        if self.vae_only:
+            return self._training_step_vae(data)
 
         if self.scorer_only:
             return self._training_step_scorer(data)
@@ -203,6 +238,30 @@ class QCNetFM(pl.LightningModule):
         self.log('train_fm_loss', loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         return loss
 
+    def _training_step_vae(self, data):
+        """Stage 0: train latent-space VAE on ground-truth trajectories.
+
+        Accepts either:
+        - dict with 'target' [N_a, T_f, D] and 'predict_mask' [N_a, T_f] (lightweight VAE loader)
+        - HeteroData with 'agent' key (legacy full DataLoader path, kept for validation)
+        """
+        if isinstance(data, dict):
+            target = data['target']
+            predict_mask = data['predict_mask']
+        else:
+            target = data['agent']['target'][..., :self.output_dim]
+            target = target / 10.0
+            predict_mask = data['agent']['predict_mask'][:, self.num_historical_steps:]
+
+        recon_x, mu, logvar = self.latent_encoder(target)
+        loss, loss_dict = self.vae_loss(recon_x, mu, logvar, target, mask=predict_mask)
+
+        self.log('train_vae_loss', loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+        self.log('train_vae_recon', loss_dict['loss_recon'], prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+        self.log('train_vae_kl', loss_dict['loss_kl'], prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+        self.log('train_vae_ortho', loss_dict['ortho_aux'], prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+        return loss
+
     def _training_step_scorer(self, data):
         """Stage 2: train only the trajectory scorer."""
         target = data['agent']['target'][..., :self.output_dim]
@@ -230,6 +289,24 @@ class QCNetFM(pl.LightningModule):
     def validation_step(self, data, batch_idx):
         if isinstance(data, Batch):
             data['agent']['av_index'] += data['agent']['ptr'][:-1]
+
+        if self.vae_only:
+            target = data['agent']['target'][..., :self.output_dim]
+            target = target / 10.0
+            predict_mask = data['agent']['predict_mask'][:, self.num_historical_steps:]
+
+            with torch.no_grad():
+                recon_x, mu, logvar = self.latent_encoder(target)
+                loss, loss_dict = self.vae_loss(recon_x, mu, logvar, target, mask=predict_mask)
+
+            self.log('val_vae_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+            self.log('val_vae_recon', loss_dict['loss_recon'], prog_bar=False, on_step=False, on_epoch=True,
+                     batch_size=1, sync_dist=True)
+            self.log('val_vae_kl', loss_dict['loss_kl'], prog_bar=False, on_step=False, on_epoch=True,
+                     batch_size=1, sync_dist=True)
+            self.log('val_vae_ortho', loss_dict['ortho_aux'], prog_bar=False, on_step=False, on_epoch=True,
+                     batch_size=1, sync_dist=True)
+            return
 
         target = data['agent']['target'][..., :self.output_dim]
         target = target / 10.0
@@ -390,7 +467,27 @@ class QCNetFM(pl.LightningModule):
              "weight_decay": 0.0},
         ]
 
-        if self.scorer_only:
+        if self.vae_only:
+            # Stage 0: only optimize latent_encoder parameters
+            vae_decay = {p for p in decay if 'latent_encoder' in p}
+            vae_no_decay = {p for p in no_decay if 'latent_encoder' in p}
+            optim_groups = [
+                {"params": [param_dict[p] for p in sorted(vae_decay)],
+                 "weight_decay": self.weight_decay},
+                {"params": [param_dict[p] for p in sorted(vae_no_decay)],
+                 "weight_decay": 0.0},
+            ]
+        elif self.freeze_vae:
+            # Stage 1: train encoder + fm_decoder, freeze latent_encoder
+            freeze_decay = {p for p in decay if 'latent_encoder' not in p}
+            freeze_no_decay = {p for p in no_decay if 'latent_encoder' not in p}
+            optim_groups = [
+                {"params": [param_dict[p] for p in sorted(freeze_decay)],
+                 "weight_decay": self.weight_decay},
+                {"params": [param_dict[p] for p in sorted(freeze_no_decay)],
+                 "weight_decay": 0.0},
+            ]
+        elif self.scorer_only:
             # Stage 2: only optimize scorer parameters, respecting whitelist/blacklist
             scorer_decay = {p for p in decay if 'scorer' in p}
             scorer_no_decay = {p for p in no_decay if 'scorer' in p}
@@ -400,7 +497,7 @@ class QCNetFM(pl.LightningModule):
                 {"params": [param_dict[p] for p in sorted(scorer_no_decay)],
                  "weight_decay": 0.0},
             ]
-        # else: Stage 1 — optim_groups already built above from all (non-scorer-excluded) params
+        # else: default — optim_groups already built above from all params
 
         optimizer = torch.optim.AdamW(optim_groups, lr=self.lr, weight_decay=self.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=self.T_max, eta_min=0.0)
@@ -425,6 +522,11 @@ class QCNetFM(pl.LightningModule):
         parser.add_argument('--dropout', type=float, default=0.1)
         parser.add_argument('--fm_num_steps', type=int, default=10)
         parser.add_argument('--scorer_only', action='store_true', default=False)
+        parser.add_argument('--vae_only', action='store_true', default=False)
+        parser.add_argument('--freeze_vae', action='store_true', default=False)
+        parser.add_argument('--vae_beta', type=float, default=0.1)
+        parser.add_argument('--vae_gamma', type=float, default=3.0)
+        parser.add_argument('--vae_num_intents', type=int, default=3)
         parser.add_argument('--pl2pl_radius', type=float, required=True)
         parser.add_argument('--time_span', type=int, default=None)
         parser.add_argument('--pl2a_radius', type=float, required=True)

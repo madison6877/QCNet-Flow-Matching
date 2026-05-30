@@ -17,3 +17,4 @@ from modules.qcnet_encoder import QCNetEncoder
 from modules.qcnet_fm_decoder import QCNetDiTBlock
 from modules.qcnet_fm_decoder import QCNetFMDecoder
 from modules.qcnet_map_encoder import QCNetMapEncoder
+from modules.latent_space_encoder import LatentSpaceEncoder

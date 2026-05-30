@@ -50,6 +50,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_epochs', type=int, default=64)
     parser.add_argument('--model_type', type=str, choices=['qcnet', 'qcnet_fm'], default='qcnet')
     parser.add_argument('--ckpt_path', type=str, default=None)
+    parser.add_argument('--vae_processed_dir', type=str, default=None)
     # parse known args to determine model class before adding model-specific args
     known_args, _ = parser.parse_known_args()
     model_cls = QCNetFM if known_args.model_type == 'qcnet_fm' else QCNet
@@ -62,14 +63,25 @@ if __name__ == '__main__':
     fit_ckpt_path = None
     if args.ckpt_path is not None:
         if args.model_type == 'qcnet_fm' and args.scorer_only:
-            print(f"🚀 [Stage 2] Loading weights from {args.ckpt_path} for scorer fine-tuning...")
+            stage_tag = 'Stage 2'
+            print(f"🚀 [{stage_tag}] Loading weights from {args.ckpt_path} for fine-tuning...")
             model = model_cls.load_from_checkpoint(args.ckpt_path, strict=False, **vars(args))
-            fit_ckpt_path = None 
+            fit_ckpt_path = None
+        elif args.model_type == 'qcnet_fm' and args.freeze_vae:
+            # Stage 1 保持不变...
+            ...
+        elif args.model_type == 'qcnet_fm' and args.vae_only:
+            # 🌟 新增：让 VAE 完美恢复断点（包含 Epoch、优化器状态和 LR 调度器）
+            print(f"🔄 [Stage 0] Resuming VAE training completely from {args.ckpt_path}...")
+            fit_ckpt_path = args.ckpt_path
         else:
             print(f"🔄 [Stage 1] Resuming training completely from {args.ckpt_path}...")
             fit_ckpt_path = args.ckpt_path
 
-    if args.model_type == 'qcnet_fm' and not args.scorer_only:
+    if args.model_type == 'qcnet_fm' and args.vae_only:
+        monitor_metric = 'val_vae_loss'
+        monitor_mode = 'min'
+    elif args.model_type == 'qcnet_fm' and not args.scorer_only:
         monitor_metric = 'val_fm_loss'
         monitor_mode = 'min'
     else:
@@ -80,8 +92,19 @@ if __name__ == '__main__':
     ##trainer = pl.Trainer(accelerator=args.accelerator, devices=args.devices,
     ##                     strategy=DDPStrategy(find_unused_parameters=False, gradient_as_bucket_view=True),
     ##                     callbacks=[model_checkpoint, lr_monitor], max_epochs=args.max_epochs)
-    trainer = pl.Trainer(accumulate_grad_batches=5, precision='bf16-mixed',
+    trainer = pl.Trainer(accumulate_grad_batches=1, precision='bf16-mixed',
                          accelerator=args.accelerator, devices=args.devices,
                          callbacks=[model_checkpoint, lr_monitor], max_epochs=args.max_epochs)
-    #trainer.fit(model, datamodule)
-    trainer.fit(model, datamodule, ckpt_path=fit_ckpt_path)
+
+    # VAE-only mode: use lightweight .pt DataLoader to bypass TargetBuilder CPU bottleneck
+    if args.model_type == 'qcnet_fm' and args.vae_only:
+        if args.vae_processed_dir is None:
+            raise ValueError('--vae_processed_dir must be set when vae_only=True')
+        print(f'⚡ [Stage 0] Preprocessing VAE data to {args.vae_processed_dir}...')
+        datamodule.prepare_vae_data()
+        vae_train_loader = datamodule.vae_train_dataloader()
+        val_loader = datamodule.val_dataloader()
+        trainer.fit(model, train_dataloaders=vae_train_loader, val_dataloaders=val_loader,
+                    ckpt_path=fit_ckpt_path)
+    else:
+        trainer.fit(model, datamodule, ckpt_path=fit_ckpt_path)
