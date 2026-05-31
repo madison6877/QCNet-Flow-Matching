@@ -101,6 +101,7 @@ if __name__ == '__main__':
         if args.vae_processed_dir is None:
             raise ValueError('--vae_processed_dir must be set when vae_only=True')
         print(f'⚡ [Stage 0] Preprocessing VAE data to {args.vae_processed_dir}...')
+        datamodule.setup(stage='fit')
         datamodule.prepare_vae_data()
         vae_train_loader = datamodule.vae_train_dataloader()
         val_loader = datamodule.val_dataloader()

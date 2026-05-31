@@ -14,4 +14,5 @@
 from layers.attention_layer import AttentionLayer
 from layers.fourier_embedding import FourierEmbedding
 from layers.mlp_layer import MLPLayer
+from layers.transformer_layer import TransformerLayer
 from layers.VAE import VAE

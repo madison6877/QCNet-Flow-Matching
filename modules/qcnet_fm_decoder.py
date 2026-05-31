@@ -24,6 +24,7 @@ from torch_geometric.data import HeteroData
 
 from layers import AttentionLayer
 from layers import FourierEmbedding
+from layers import TransformerLayer
 from utils import angle_between_2d_vectors
 from utils import bipartite_dense_to_sparse
 from utils import weight_init
@@ -70,26 +71,6 @@ class TrajectoryScorer(nn.Module):
         return logits
 
 
-class GatedMHA(nn.Module):
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float) -> None:
-        super(GatedMHA, self).__init__()
-        self.attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.to_s = nn.Linear(hidden_dim, hidden_dim)
-        self.to_g = nn.Linear(2 * hidden_dim, hidden_dim)
-
-    def forward(self, x: torch.Tensor, seg_emb: torch.Tensor) -> torch.Tensor:
-        q = k = x + seg_emb.unsqueeze(0)
-        v = x
-        attn_out, _ = self.attn(q, k, v, need_weights=False)
-        g = torch.sigmoid(self.to_g(torch.cat([attn_out, x], dim=-1)))
-        return attn_out + g * (self.to_s(x) - attn_out)
-
-
 class QCNetDiTBlock(nn.Module):
     def __init__(self,
                  hidden_dim: int,
@@ -117,7 +98,7 @@ class QCNetDiTBlock(nn.Module):
                                         dropout=dropout, bipartite=True, has_pos_emb=True)
         self.a2a_attn = AttentionLayer(hidden_dim=hidden_dim, num_heads=num_heads, head_dim=head_dim,
                                        dropout=dropout, bipartite=False, has_pos_emb=True)
-        self.seg_attn = GatedMHA(hidden_dim=hidden_dim, num_heads=num_heads, dropout=dropout)
+        self.seg_attn = TransformerLayer(hidden_dim=hidden_dim, num_heads=num_heads, dropout=dropout)
 
         self.ffn = nn.Sequential(
             nn.Linear(hidden_dim, 4 * hidden_dim),
@@ -172,8 +153,8 @@ class QCNetDiTBlock(nn.Module):
         # Step 1: Dense segment-to-segment self-attention
         shift1, scale1 = ss1.chunk(2, dim=-1)
         x_mod = self.norm1(x_flat) * (1.0 + scale1) + shift1
-        x_seg = x_mod.reshape(N_a, K, self.hidden_dim)            
-        seg_out = self.seg_attn(x=x_seg, seg_emb=seg_emb)
+        x_seg = x_mod.reshape(N_a, K, self.hidden_dim)
+        seg_out = self.seg_attn(x=x_seg, context=seg_emb)
         x_flat += seg_out.reshape(N_a * K, self.hidden_dim)
 
         # Step 2: Temporal cross-attention (t2a)
@@ -200,6 +181,7 @@ class QCNetDiTBlock(nn.Module):
         x = x_flat.reshape(N_a, K, self.hidden_dim)
 
         return x
+
 
 class QCNetFMDecoder(nn.Module):
     def __init__(self,
@@ -406,7 +388,7 @@ class QCNetFMDecoder(nn.Module):
         # ---- Step 3: DiT blocks (all K segments in parallel, using pre-expanded ctx) ----
         for block in self.blocks:
             x = block(
-                x=x, t_emb_s=t_emb_s, 
+                x=x, t_emb_s=t_emb_s,
                 seg_emb=seg_emb, K=K,
                 x_t=ctx['x_t_hist'],
                 r_t2a_exp=ctx['r_t2a_exp'], edge_index_t2a_exp=ctx['edge_index_t2a_exp'],
@@ -520,15 +502,15 @@ class QCNetFMDecoder(nn.Module):
         if not valid.any():
             # 如果整个 Batch 都没有有效目标，返回带梯度的 0 防治报错
             return torch.tensor(0.0, device=trajectories.device, requires_grad=True)
-        
+
         # 提取有效智能体的 FDE 和 Logits
         valid_fde = fde[valid]       # [有效N_a, K]
         valid_logits = logits[valid] # [有效N_a, K]
-        
+
         # 引入温度系数 (Temperature, alpha)，控制惩罚的严厉程度
         # alpha 越大，越接近 hard label; alpha 越小，越平滑。通常取 1.0 ~ 2.0
-        alpha = 1.5 
-        
+        alpha = 1.5
+
         # 把距离 (FDE) 转换成目标概率分布 (Target Probabilities)
         # 距离越小，取负数后越大，Softmax 后的概率就越高！
         target_probs = F.softmax(-alpha * valid_fde, dim=-1)  # [有效N_a, K]
@@ -536,5 +518,5 @@ class QCNetFMDecoder(nn.Module):
         # 7. 计算交叉熵损失
         # 此时 logits 是 [有效N_a, K]，positive_idx 是纯粹的一维整数索引 [有效N_a]
         loss = F.cross_entropy(valid_logits, target_probs)
-        
+
         return loss
