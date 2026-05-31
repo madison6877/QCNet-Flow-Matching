@@ -133,7 +133,7 @@ class QCNetDiTBlock(nn.Module):
                 x: torch.Tensor,
                 t_emb_s: torch.Tensor,
                 x_t: torch.Tensor,
-                seg_emb: torch.Tensor,
+                freq_pos_emb: torch.Tensor,
                 r_t2a_exp: torch.Tensor,
                 edge_index_t2a_exp: torch.Tensor,
                 x_pl: torch.Tensor,
@@ -150,37 +150,80 @@ class QCNetDiTBlock(nn.Module):
         shift_scale_all = self.adaLN_all(t_emb_flat)
         ss1, ss2, ss3, ss4, ss5 = shift_scale_all.chunk(5, dim=-1)
 
-        # Step 1: Dense segment-to-segment self-attention
+        # Step 1: Frequency token self-attention (add learnable freq_pos_emb, then self-attend)
         shift1, scale1 = ss1.chunk(2, dim=-1)
         x_mod = self.norm1(x_flat) * (1.0 + scale1) + shift1
         x_seg = x_mod.reshape(N_a, K, self.hidden_dim)
-        seg_out = self.seg_attn(x=x_seg, context=seg_emb)
-        x_flat += seg_out.reshape(N_a * K, self.hidden_dim)
+        seg_out = self.seg_attn(x=x_seg, context=freq_pos_emb)
+        x_flat = x_flat + seg_out.reshape(N_a * K, self.hidden_dim)
 
         # Step 2: Temporal cross-attention (t2a)
         shift2, scale2 = ss2.chunk(2, dim=-1)
         x_mod = self.norm2(x_flat) * (1.0 + scale2) + shift2
-        x_flat += self.t2a_attn((x_t, x_mod), r_t2a_exp, edge_index_t2a_exp)
+        x_flat = x_flat + self.t2a_attn((x_t, x_mod), r_t2a_exp, edge_index_t2a_exp)
 
         # Step 3: Map cross-attention (pl2a)
         shift3, scale3 = ss3.chunk(2, dim=-1)
         x_mod = self.norm3(x_flat) * (1.0 + scale3) + shift3
-        x_flat += self.pl2a_attn((x_pl, x_mod), r_pl2a_exp, edge_index_pl2a_exp)
+        x_flat = x_flat + self.pl2a_attn((x_pl, x_mod), r_pl2a_exp, edge_index_pl2a_exp)
 
         # Step 4: Agent self-attention (a2a)
         shift4, scale4 = ss4.chunk(2, dim=-1)
         x_mod = self.norm4(x_flat) * (1.0 + scale4) + shift4
-        x_flat += self.a2a_attn(x_mod, r_a2a_exp, edge_index_a2a_exp)
+        x_flat = x_flat + self.a2a_attn(x_mod, r_a2a_exp, edge_index_a2a_exp)
 
         # Step 5: Feed-Forward Network
         shift5, scale5 = ss5.chunk(2, dim=-1)
         x_mod = self.norm5(x_flat) * (1.0 + scale5) + shift5
-        x_flat += self.ffn(x_mod)
+        x_flat = x_flat + self.ffn(x_mod)
 
         # Reshape back to [N_a, K, H]
         x = x_flat.reshape(N_a, K, self.hidden_dim)
 
         return x
+
+
+class AsymmetricVelocityHead(nn.Module):
+    """Asymmetric velocity prediction heads for low/mid/high frequency bands.
+
+    Low-freq:   2-layer MLP  (easiest to learn)
+    Mid-freq:   3-layer MLP
+    High-freq:  4-layer MLP  (hardest to learn)
+    """
+
+    def __init__(self, hidden_dim: int, output_dim: int) -> None:
+        super(AsymmetricVelocityHead, self).__init__()
+        self.head_low = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self.head_mid = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        self.head_high = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [N_a, 3, H] -> velocity: [N_a, 3, H]"""
+        out_low = self.head_low(x[:, 0])
+        out_mid = self.head_mid(x[:, 1])
+        out_high = self.head_high(x[:, 2])
+        return torch.stack([out_low, out_mid, out_high], dim=1)
 
 
 class QCNetFMDecoder(nn.Module):
@@ -219,15 +262,9 @@ class QCNetFMDecoder(nn.Module):
         input_dim_r_pl2a = 3
         input_dim_r_a2a = 3
 
-        self.num_segments = 3  # K segments: 60 steps / 3 = 20 steps per segment
+        self.num_intents = 3  # K frequency tokens: low, mid, high
 
-        self.type_a_emb = nn.Embedding(10, hidden_dim)
-        self.x_t_proj = FourierEmbedding(input_dim=output_dim, hidden_dim=hidden_dim, num_freq_bands=num_freq_bands)
-        self.traj_emb = nn.GRU(input_size=hidden_dim, hidden_size=hidden_dim, num_layers=1, bias=True,
-                               batch_first=False, dropout=0.0, bidirectional=False)
-        self.traj_emb_h0 = nn.Parameter(torch.zeros(1, hidden_dim))
-
-        self.seg_emb = nn.Embedding(self.num_segments, hidden_dim)
+        self.freq_pos_emb = nn.Parameter(torch.randn(self.num_intents, hidden_dim))
 
         self.t_emb = FourierEmbedding(input_dim=1, hidden_dim=hidden_dim, num_freq_bands=num_freq_bands)
 
@@ -243,12 +280,7 @@ class QCNetFMDecoder(nn.Module):
              for _ in range(num_layers)]
         )
 
-        self.to_vel = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, (num_future_steps // self.num_segments) * output_dim),
-        )
+        self.to_vel = AsymmetricVelocityHead(hidden_dim=hidden_dim, output_dim=hidden_dim)
 
         # Trajectory scorer for multi-modal ranking
         self.scorer = TrajectoryScorer(
@@ -326,8 +358,8 @@ class QCNetFMDecoder(nn.Module):
         x_pl = scene_enc['x_pl'][:, self.num_historical_steps - 1]
         agent_batch = data['agent']['batch']
 
-        # pre-expand spatial edges and relations for K segments (cached, not recomputed per layer/step)
-        K = self.num_segments
+        # pre-expand spatial edges and relations for K frequency tokens (cached, not recomputed per layer/step)
+        K = self.num_intents
         edge_index_t2a_exp = QCNetDiTBlock._expand_edge_index(edge_index_t2a, K, bipartite=True)
         edge_index_pl2a_exp = QCNetDiTBlock._expand_edge_index(edge_index_pl2a, K, bipartite=True)
         edge_index_a2a_exp = QCNetDiTBlock._expand_edge_index(edge_index_a2a, K, bipartite=False)
@@ -353,43 +385,33 @@ class QCNetFMDecoder(nn.Module):
     def _forward_core(self,
                       ctx: Dict[str, torch.Tensor],
                       x_t: torch.Tensor,
-                      t: torch.Tensor,
-                      agent_type: torch.Tensor) -> torch.Tensor:
-        N_a = x_t.size(0)
-        K = self.num_segments                     # 3
-        T_seg = self.num_future_steps // K         # 20
+                      t: torch.Tensor) -> torch.Tensor:
+        """Latent-space velocity field prediction.
+
+        Args:
+            ctx:  pre-computed graph context from _build_graph_context
+            x_t:  [N_a, K, H] latent frequency tokens (noised)
+            t:    [N_a] per-agent diffusion timestep
+
+        Returns:
+            v_theta: [N_a, K, H] predicted velocity for each frequency band
+        """
+        N_a, K, H = x_t.shape
         device = x_t.device
 
-        # categorical embeddings per agent (use expand to avoid memory copy, then reshape)
-        cat_emb = self.type_a_emb(agent_type.long())                                # [N_a, H]
-        cat_emb = cat_emb[:, None, None, :].expand(N_a, K, T_seg, self.hidden_dim)  # [N_a, K, T_seg, H]
-        cat_emb = cat_emb.contiguous().view(N_a * K * T_seg, self.hidden_dim)        # [N_a*60, H]
-
-        # ---- Step 1: split into K segments + shared GRU encode ----
-        x = x_t.reshape(N_a * K * T_seg, self.output_dim)          # [N_a*60, D]
-        x = self.x_t_proj(continuous_inputs=x, categorical_embs=[cat_emb])
-        x = x.reshape(N_a * K, T_seg, self.hidden_dim)             # [N_a*K, 20, H]
-        x = x.transpose(0, 1).contiguous()                          # [20, N_a*K, H] — contiguous for GRU
-        x = self.traj_emb(x, self.traj_emb_h0.unsqueeze(1).expand(1, N_a * K, self.hidden_dim))[1].squeeze(0)  # [N_a*K, H]
-        x = x.reshape(N_a, K, self.hidden_dim)                     # [N_a, K, H]
-
-        # ---- Step 2: time & segment embeddings → per-segment modulation ----
+        # ---- Step 1: Time embedding (per-agent, shared across K tokens) ----
         if t.dim() == 0:
             t = t.unsqueeze(0)
         t_emb = self.t_emb(continuous_inputs=t.unsqueeze(-1), categorical_embs=None)
-        t_emb = t_emb[ctx['agent_batch']]                          # [N_a, H]
+        t_emb = t_emb[ctx['agent_batch']]                           # [N_a, H]
+        t_emb_s = t_emb.unsqueeze(1).expand(N_a, K, H)              # [N_a, K, H]
 
-        seg_idx = torch.arange(K, device=device)                   # [K]
-        seg_emb = self.seg_emb(seg_idx)                        # [K, H]
-
-        # Per-segment time modulation: t_emb_s[a, s, :] = t_emb[a] + seg_emb_all[s]
-        t_emb_s = t_emb.unsqueeze(1) + seg_emb.unsqueeze(0)   # [N_a, K, H]
-
-        # ---- Step 3: DiT blocks (all K segments in parallel, using pre-expanded ctx) ----
+        # ---- Step 2: DiT blocks (K frequency tokens in parallel) ----
+        x = x_t
         for block in self.blocks:
             x = block(
                 x=x, t_emb_s=t_emb_s,
-                seg_emb=seg_emb, K=K,
+                freq_pos_emb=self.freq_pos_emb, K=K,
                 x_t=ctx['x_t_hist'],
                 r_t2a_exp=ctx['r_t2a_exp'], edge_index_t2a_exp=ctx['edge_index_t2a_exp'],
                 x_pl=ctx['x_pl'],
@@ -397,11 +419,8 @@ class QCNetFMDecoder(nn.Module):
                 r_a2a_exp=ctx['r_a2a_exp'], edge_index_a2a_exp=ctx['edge_index_a2a_exp'],
             )
 
-        # ---- Step 4: velocity output (per segment) ----
-        x = x.reshape(N_a * K, self.hidden_dim)                    # [N_a*K, H]
-        v = self.to_vel(x)                                          # [N_a*K, T_seg * D]
-        v = v.reshape(N_a, K, T_seg, self.output_dim)               # [N_a, K, 20, D]
-        v_theta = v.reshape(N_a, K * T_seg, self.output_dim)        # [N_a, 60, D]
+        # ---- Step 3: Asymmetric velocity output (3 separate heads) ----
+        v_theta = self.to_vel(x)  # [N_a, K, H]
 
         return v_theta
 
@@ -411,19 +430,30 @@ class QCNetFMDecoder(nn.Module):
                 x_t: torch.Tensor,
                 t: torch.Tensor) -> torch.Tensor:
         ctx = self._build_graph_context(data, scene_enc)
-        agent_type = data['agent']['type']
-        return self._forward_core(ctx, x_t, t, agent_type)
+        return self._forward_core(ctx, x_t, t)
 
     @torch.no_grad()
     def sample(self,
                data: HeteroData,
                scene_enc: Mapping[str, torch.Tensor],
                num_modes: int = 6,
-               num_steps: int = 10) -> Tuple[torch.Tensor, torch.Tensor]:
+               num_steps: int = 10,
+               latent_decoder: Optional[nn.Module] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample trajectories via latent flow matching, optionally decode to physical space.
 
-        # pre-compute invariant graph context once
+        Args:
+            data:            HeteroData graph for the scene
+            scene_enc:       encoded scene features from QCNetEncoder
+            num_modes:       number of trajectory modes to sample
+            num_steps:       ODE integration steps
+            latent_decoder:  optional VAE decoder (LatentSpaceDecoder) to map latent → physical
+
+        Returns:
+            trajectories: [N_a, num_modes, ...]  physical trajectories (if decoder given)
+                                                   or latent tokens [N_a, num_modes, K, H]
+            pi:          [N_a, num_modes]          selection probabilities
+        """
         ctx = self._build_graph_context(data, scene_enc)
-        agent_type = data['agent']['type']
         N_a = ctx['pos_m'].size(0)
         device = ctx['pos_m'].device
 
@@ -431,42 +461,45 @@ class QCNetFMDecoder(nn.Module):
         dt = 1.0 / num_steps
         t_grid = torch.linspace(0.0, 1.0 - dt, num_steps, device=device)
 
-        # determine batch size B from agent_batch
         B = int(ctx['agent_batch'].max().item()) + 1 if ctx['agent_batch'].numel() > 0 else 1
 
-        all_trajs: List[torch.Tensor] = []
-        # Pre-allocate reusable time tensors to avoid repeated torch.full allocs
+        all_outputs: List[torch.Tensor] = []
         t_cur_tensor = torch.empty(B, device=device)
         t_next_tensor = torch.empty(B, device=device)
 
         for _ in range(num_modes):
-            # initial noise: x_0 ~ N(0, I)
-            x_t = torch.randn(N_a, self.num_future_steps, self.output_dim, device=device)
+            # initial noise in latent space: x_0 ~ N(0, I)  → [N_a, K, H]
+            x_t = torch.randn(N_a, self.num_intents, self.hidden_dim, device=device)
             for t_val in t_grid:
                 t_cur_tensor.fill_(t_val)
                 t_next_tensor.fill_(t_val + dt)
 
-                # Step 1: 在当前位置计算速度 (v1)
-                v1 = self._forward_core(ctx, x_t, t_cur_tensor, agent_type)
-                
-                # Step 2: 沿着 v1 往前探一步 (Euler 探路)
+                # Step 1: Velocity at current position
+                v1 = self._forward_core(ctx, x_t, t_cur_tensor)
+                # Step 2: Euler probe
                 x_euler = x_t + v1 * dt
-                
-                # Step 3: 在探出的新位置上，注入未来的时间 t_next，计算未来速度 (v2)
-                v2 = self._forward_core(ctx, x_euler, t_next_tensor, agent_type)
-                
-                # Step 4: Heun 修正与更新
+                # Step 3: Velocity at probe position
+                v2 = self._forward_core(ctx, x_euler, t_next_tensor)
+                # Step 4: Heun correction
                 v_heun = 0.5 * (v1 + v2)
                 x_t = x_t + v_heun * dt
 
-            all_trajs.append(x_t)
+            # Decode to physical space if decoder is provided
+            if latent_decoder is not None:
+                output = latent_decoder(x_t)  # [N_a, T_f, D]
+            else:
+                output = x_t  # [N_a, K, H] (keep latent for debugging)
+            all_outputs.append(output)
 
-        trajectories = torch.stack(all_trajs, dim=1)  # [N_a, num_modes, T_f, D]
+        trajectories = torch.stack(all_outputs, dim=1)  # [N_a, num_modes, ...]
 
-        # Score trajectories using the scorer (use last history step as agent context)
-        agent_context = scene_enc['x_a'][:, -1, :]  # [N_a, hidden_dim] — t=0 agent feature
-        logits = self.scorer(agent_context, trajectories)  # [N_a, num_modes]
-        pi = F.softmax(logits, dim=-1)  # [N_a, num_modes]
+        # Score requires physical trajectories; skip scoring if in latent space
+        if latent_decoder is not None:
+            agent_context = scene_enc['x_a'][:, -1, :]
+            logits = self.scorer(agent_context, trajectories)
+            pi = F.softmax(logits, dim=-1)
+        else:
+            pi = torch.ones(N_a, num_modes, device=device) / num_modes
 
         return trajectories, pi
 

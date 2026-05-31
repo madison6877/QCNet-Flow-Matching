@@ -63,3 +63,13 @@ class LatentSpaceEncoder(nn.Module):
             return z, mu, logvar
         recon_x = self.vae.decode(z)
         return recon_x, mu, logvar
+
+    @torch.no_grad()
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode trajectory → latent z (no gradient, mode preserved).
+
+        Returns:
+            z: [N_a, 3, H]  batch-first latent vectors
+        """
+        mu, logvar, z = self.vae.encode(x)
+        return z.transpose(0, 1).contiguous()  # [3, N_a, H] → [N_a, 3, H]

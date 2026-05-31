@@ -51,6 +51,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_type', type=str, choices=['qcnet', 'qcnet_fm'], default='qcnet')
     parser.add_argument('--ckpt_path', type=str, default=None)
     parser.add_argument('--vae_processed_dir', type=str, default=None)
+    parser.add_argument('--resume', action='store_true', default=False)
     # parse known args to determine model class before adding model-specific args
     known_args, _ = parser.parse_known_args()
     model_cls = QCNetFM if known_args.model_type == 'qcnet_fm' else QCNet
@@ -62,21 +63,15 @@ if __name__ == '__main__':
     model = model_cls(**vars(args))
     fit_ckpt_path = None
     if args.ckpt_path is not None:
-        if args.model_type == 'qcnet_fm' and args.scorer_only:
-            stage_tag = 'Stage 2'
-            print(f"🚀 [{stage_tag}] Loading weights from {args.ckpt_path} for fine-tuning...")
-            model = model_cls.load_from_checkpoint(args.ckpt_path, strict=False, **vars(args))
-            fit_ckpt_path = None
-        elif args.model_type == 'qcnet_fm' and args.freeze_vae:
-            # Stage 1 保持不变...
-            ...
-        elif args.model_type == 'qcnet_fm' and args.vae_only:
-            # 🌟 新增：让 VAE 完美恢复断点（包含 Epoch、优化器状态和 LR 调度器）
-            print(f"🔄 [Stage 0] Resuming VAE training completely from {args.ckpt_path}...")
+        if args.resume:
+            # 【阶段内中断恢复】：带上 optimizer、epoch、lr scheduler 全部状态，继续训练
+            print(f"🔄 [Resume] 正在从 {args.ckpt_path} 完全恢复训练进度 (包含优化器和 Epoch)...")
             fit_ckpt_path = args.ckpt_path
         else:
-            print(f"🔄 [Stage 1] Resuming training completely from {args.ckpt_path}...")
-            fit_ckpt_path = args.ckpt_path
+            # 【跨阶段全新启动】：只加载模型权重，剥离所有优化器状态，从 Epoch 0 重新开始
+            print(f"🚀 [New Stage] 正在从 {args.ckpt_path} 仅加载预训练权重 (作为全新阶段的起点)...")
+            model = model_cls.load_from_checkpoint(args.ckpt_path, strict=False, **vars(args))
+            fit_ckpt_path = None
 
     if args.model_type == 'qcnet_fm' and args.vae_only:
         monitor_metric = 'val_vae_loss'
@@ -89,10 +84,7 @@ if __name__ == '__main__':
         monitor_mode = 'min'
     model_checkpoint = ModelCheckpoint(monitor=monitor_metric, mode=monitor_mode, save_top_k=5, save_last=True, save_weights_only=False)
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
-    ##trainer = pl.Trainer(accelerator=args.accelerator, devices=args.devices,
-    ##                     strategy=DDPStrategy(find_unused_parameters=False, gradient_as_bucket_view=True),
-    ##                     callbacks=[model_checkpoint, lr_monitor], max_epochs=args.max_epochs)
-    trainer = pl.Trainer(accumulate_grad_batches=1, precision='bf16-mixed',
+    trainer = pl.Trainer(accumulate_grad_batches=5, precision='bf16-mixed',
                          accelerator=args.accelerator, devices=args.devices,
                          callbacks=[model_checkpoint, lr_monitor], max_epochs=args.max_epochs)
 

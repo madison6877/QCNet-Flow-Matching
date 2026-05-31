@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from losses.flow_matching_loss import FlowMatchingLoss
+from losses.flow_matching_loss import LatentFlowMatchingLoss
 from losses.vae_loss import VAELoss
 from losses.focal_loss import FocalLoss
 from losses.gaussian_nll_loss import GaussianNLLLoss

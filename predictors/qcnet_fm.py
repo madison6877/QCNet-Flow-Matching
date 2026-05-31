@@ -25,6 +25,7 @@ from torch_geometric.data import Batch
 from torch_geometric.data import HeteroData
 
 from losses import FlowMatchingLoss
+from losses import LatentFlowMatchingLoss
 from losses import VAELoss
 from metrics import Brier
 from metrics import MR
@@ -35,6 +36,7 @@ from metrics import minFHE
 from modules import QCNetEncoder
 from modules import QCNetFMDecoder
 from modules import LatentSpaceEncoder
+from modules import LatentSpaceDecoder
 
 try:
     from av2.datasets.motion_forecasting.eval.submission import ChallengeSubmission
@@ -148,7 +150,8 @@ class QCNetFM(pl.LightningModule):
             dropout=dropout,
         )
 
-        self.fm_loss = FlowMatchingLoss(reduction='none')
+        # Latent Flow Matching loss with configurable per-band weights
+        self.latent_fm_loss = LatentFlowMatchingLoss()
 
         self.latent_encoder = LatentSpaceEncoder(
             hidden_dim=hidden_dim,
@@ -156,6 +159,7 @@ class QCNetFM(pl.LightningModule):
             num_future_steps=num_future_steps,
             num_intents=vae_num_intents,
         )
+        self.latent_decoder = LatentSpaceDecoder(vae=self.latent_encoder.vae)
         self.vae_loss = VAELoss(beta=vae_beta, gamma=vae_gamma)
 
         self.minADE = minADE(max_guesses=6)
@@ -192,50 +196,34 @@ class QCNetFM(pl.LightningModule):
         if self.scorer_only:
             return self._training_step_scorer(data)
 
+        # ---- Stage 1: Latent Flow Matching ----
         target = data['agent']['target'][..., :self.output_dim]
-        if batch_idx == 0:  # 只在每个 epoch 的第一个 batch 打印
-            # target 的 shape 是 [N_a, T_f, D]，T_f 是未来的 60 个时间步
-            first_step_coords = target[:, 0, :] # 取出所有 Agent 预测的第一步坐标
-            last_step_coords = target[:, -1, :] # 取出最后一步坐标（作为参照）
-            
-            print(f"\n--- 🕵️ 物理坐标探雷仪 ---")
-            print(f"前 8 个 Agent 的第 1 步坐标 (米): \n{first_step_coords[:8].detach().cpu().numpy()}")
-            print(f"前 8 个 Agent 的第 60 步坐标 (米): \n{last_step_coords[:8].detach().cpu().numpy()}")
-            print(f"--------------------------\n")
         target = target / 10.0
         predict_mask = data['agent']['predict_mask'][:, self.num_historical_steps:]
 
-        if batch_idx == 0:  # 依然只在第一个 batch 打印
-            # 1. 计算所有有效 Agent 的真实位移 (米)
-            disp = torch.norm(target[:, -1, :2] - target[:, 0, :2], dim=-1) * 10.0
-            
-            # 2. 统计运动车辆的比例 (位移 > 2 米视为运动)
-            moving_ratio = (disp > 2.0).float().mean().item()
-            
-            print(f"\n--- 📊 数据动力学探针 ---")
-            print(f"真实运动 Agent 比例 (>2m): {moving_ratio * 100:.2f}%")
-            print(f"最大位移: {disp.max().item():.2f} 米, 平均位移: {disp.mean().item():.2f} 米")
-            print(f"--------------------------\n")
-
+        # Encode ground-truth trajectory into 3 latent intent vectors [N_a, 3, H]
+        self.latent_encoder.eval()
+        with torch.no_grad():
+            z_target = self.latent_encoder.encode(target)  # [N_a, 3, H]
 
         agent_batch = data['agent'].get('batch', None)
-        x_0, t = FlowMatchingLoss.sample_noise_and_time(target, self.device, agent_batch)
-        # x_0: [N_a, T_f, D], t: [N_a] (per-scene t broadcast to agents)
+        x_0, t = FlowMatchingLoss.sample_noise_and_time_latent(
+            self.vae_num_intents, target.size(0), self.hidden_dim, self.device, agent_batch)
+        # x_0: [N_a, 3, H], t: [N_a]
 
-        # Construct noisy trajectory via linear interpolation: x_t = t * x_1 + (1 - t) * x_0
+        # Linear interpolation in latent space: x_t = t * z_target + (1 - t) * x_0
         t_exp = t[:, None, None]
-        x_t = (1 - t_exp) * x_0 + t_exp * target
+        x_t = (1 - t_exp) * x_0 + t_exp * z_target
 
         scene_enc = self.encoder(data)
-        v_theta = self(data, scene_enc, x_t, t)
+        v_theta = self(data, scene_enc, x_t, t)  # [N_a, 3, H]
 
-        # Target velocity field: u_t = x_1 - x_0
-        u_t = target - x_0
-        per_elem_loss = (v_theta - u_t).pow(2).sum(dim=-1)  # [N_a, T_f]
-        masked_loss = per_elem_loss * predict_mask
-        loss = masked_loss.sum() / predict_mask.sum().clamp_(min=1)
-
-        self.log('train_fm_loss', loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
+        loss, loss_dict = self.latent_fm_loss(v_theta, z_target, x_0)
+        
+        self.log('val_fm_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('v_low', loss_dict['low'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('v_mid', loss_dict['mid'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('v_high', loss_dict['high'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
         return loss
 
     def _training_step_vae(self, data):
@@ -275,7 +263,8 @@ class QCNetFM(pl.LightningModule):
         with torch.no_grad():
             scene_enc = self.encoder(data)
             trajectories, _ = self.fm_decoder.sample(
-                data, scene_enc, num_modes=self.num_modes, num_steps=self.fm_num_steps
+                data, scene_enc, num_modes=self.num_modes, num_steps=self.fm_num_steps,
+                latent_decoder=self.latent_decoder,
             )
         
         self.train()
@@ -315,18 +304,22 @@ class QCNetFM(pl.LightningModule):
         agent_batch = data['agent'].get('batch', None)
         with torch.no_grad():
             scene_enc = self.encoder(data)
-            x_0, t = FlowMatchingLoss.sample_noise_and_time(target, self.device, agent_batch)
+
+            # Encode target to latent for validation loss computation
+            z_target = self.latent_encoder.encode(target)  # [N_a, 3, H]
+
+            x_0, t = FlowMatchingLoss.sample_noise_and_time_latent(
+                self.vae_num_intents, target.size(0), self.hidden_dim, self.device, agent_batch)
             t_exp = t[:, None, None]
-            x_t = (1 - t_exp) * x_0 + t_exp * target
+            x_t = (1 - t_exp) * x_0 + t_exp * z_target
             v_theta = self(data, scene_enc, x_t, t)
 
-            u_t = target - x_0
-            per_elem_loss = (v_theta - u_t).pow(2).sum(dim=-1)
-            masked_loss = per_elem_loss * predict_mask
-
-        loss = masked_loss.sum() / predict_mask.sum().clamp_(min=1)
+        loss, loss_dict = self.latent_fm_loss(v_theta, z_target, x_0)
         
         self.log('val_fm_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('v_low', loss_dict['low'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('v_mid', loss_dict['mid'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('v_high', loss_dict['high'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
 
         # Stage 1: stop here, only evaluate FM velocity field loss
         if not self.scorer_only :
@@ -342,7 +335,8 @@ class QCNetFM(pl.LightningModule):
         if eval_mask.any():
             with torch.no_grad():
                 traj_samples, pi = self.fm_decoder.sample(
-                    data, scene_enc, num_modes=self.num_modes, num_steps=self.fm_num_steps
+                    data, scene_enc, num_modes=self.num_modes, num_steps=self.fm_num_steps,
+                    latent_decoder=self.latent_decoder,
                 )
                 # traj_samples: [N_a, num_modes, T_f, D], pi: [N_a, num_modes]
 
@@ -393,7 +387,8 @@ class QCNetFM(pl.LightningModule):
 
         scene_enc = self.encoder(data)
         traj_samples, pi = self.fm_decoder.sample(
-            data, scene_enc, num_modes=self.num_modes, num_steps=self.fm_num_steps
+            data, scene_enc, num_modes=self.num_modes, num_steps=self.fm_num_steps,
+            latent_decoder=self.latent_decoder,
         )
         # traj_samples: [N_a, num_modes, T_f, D], pi: [N_a, num_modes]
         traj_samples = traj_samples * 10.0
@@ -455,6 +450,9 @@ class QCNetFM(pl.LightningModule):
                 elif not ('weight' in param_name or 'bias' in param_name):
                     no_decay.add(full_param_name)
         param_dict = {param_name: param for param_name, param in self.named_parameters()}
+        # 🌟 核心修复：把那些 PyTorch 模型树中因为参数共享产生的“幻影别名”过滤掉
+        decay = {p for p in decay if p in param_dict}
+        no_decay = {p for p in no_decay if p in param_dict}
         inter_params = decay & no_decay
         union_params = decay | no_decay
         assert len(inter_params) == 0

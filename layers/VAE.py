@@ -20,42 +20,21 @@ from layers.fourier_embedding import FourierEmbedding
 from utils import weight_init
 
 
-class VAE(nn.Module):
-    """Variational Auto-Encoder for trajectory latent space encoding.
+class VAEEncoderBlock(nn.Module):
+    """A single encoder block: Temporal SA → Intent SA → Intent×Trajectory CA.
 
-    Encoder pipeline:
-      1. FourierEmbedding per timestep
-      2. Temporal self-attention block (60 steps)
-      3. Intent-to-intent self-attention block (3 intents communicate first)
-      4. Intent×trajectory cross-attention block
-      5. Reparameterization into latent variables Z
-
-    Decoder pipeline:
-      1. Time-query × latent cross-attention block
-      2. Shared MLP mapping to (x, y) coordinates
-
-    Every attention block follows Pre-Norm → Attention → Residual → Pre-Norm → FFN → Residual.
+    Stackable via nn.ModuleList to form a deep encoder.
     """
 
     def __init__(self,
                  hidden_dim: int,
-                 input_dim: int = 2,
-                 num_future_steps: int = 60,
                  num_intents: int = 3,
-                 num_freq_bands: int = 64,
                  num_heads: int = 8,
                  dropout: float = 0.1) -> None:
-        super(VAE, self).__init__()
-        self.hidden_dim = hidden_dim
-        self.input_dim = input_dim
-        self.num_future_steps = num_future_steps
+        super(VAEEncoderBlock, self).__init__()
         self.num_intents = num_intents
 
-        # ---- Encoder: Fourier embedding ----
-        self.fourier_emb = FourierEmbedding(input_dim=input_dim, hidden_dim=hidden_dim,
-                                            num_freq_bands=num_freq_bands)
-
-        # ---- Encoder: Temporal self-attention block ----
+        # ---- Temporal self-attention block ----
         self.temporal_sa_norm1 = nn.LayerNorm(hidden_dim)
         self.temporal_sa = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads,
                                                   dropout=dropout, batch_first=False)
@@ -67,9 +46,7 @@ class VAE(nn.Module):
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
 
-        # ---- Encoder: Intent self-attention block (3 intents communicate first) ----
-        self.intent_queries = nn.Parameter(torch.randn(num_intents, 1, hidden_dim))
-
+        # ---- Intent self-attention block ----
         self.intent_sa_norm1 = nn.LayerNorm(hidden_dim)
         self.intent_sa = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads,
                                                 dropout=dropout, batch_first=False)
@@ -81,7 +58,7 @@ class VAE(nn.Module):
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
 
-        # ---- Encoder: Intent×trajectory cross-attention block ----
+        # ---- Intent×trajectory cross-attention block ----
         self.intent_ca_norm1_q = nn.LayerNorm(hidden_dim)
         self.intent_ca_norm1_kv = nn.LayerNorm(hidden_dim)
         self.intent_ca = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads,
@@ -94,41 +71,11 @@ class VAE(nn.Module):
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
 
-        # ---- Reparameterization (shared MLP) ----
-        self.reparam_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim * 2),
-        )
-
-        # ---- Decoder: Time-query×latent cross-attention block ----
-        self.time_queries = nn.Parameter(torch.randn(num_future_steps, 1, hidden_dim))
-
-        self.decoder_ca_norm1_q = nn.LayerNorm(hidden_dim)
-        self.decoder_ca_norm1_kv = nn.LayerNorm(hidden_dim)
-        self.decoder_ca = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads,
-                                                 dropout=dropout, batch_first=False)
-        self.decoder_ca_norm2 = nn.LayerNorm(hidden_dim)
-        self.decoder_ca_ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 4, hidden_dim),
-        )
-
-        # ---- Decoder: Coordinate mapping ----
-        self.decoder_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, input_dim),
-        )
-
-        self.apply(weight_init)
-
     # ------------------------------------------------------------------
-    #  Helper: self-attention transformer block (no bipartite pre-norms)
+    #  Helper: self-attention transformer block
     # ------------------------------------------------------------------
-    def _self_attn_block(self, x: torch.Tensor,
+    @staticmethod
+    def _self_attn_block(x: torch.Tensor,
                          norm1: nn.LayerNorm,
                          attn: nn.MultiheadAttention,
                          norm2: nn.LayerNorm,
@@ -143,8 +90,8 @@ class VAE(nn.Module):
     # ------------------------------------------------------------------
     #  Helper: cross-attention transformer block
     # ------------------------------------------------------------------
-    def _cross_attn_block(self,
-                          q: torch.Tensor,
+    @staticmethod
+    def _cross_attn_block(q: torch.Tensor,
                           kv: torch.Tensor,
                           norm_q: nn.LayerNorm,
                           norm_kv: nn.LayerNorm,
@@ -158,6 +105,191 @@ class VAE(nn.Module):
         q = q + attn_out
         q = q + ffn(norm2(q))
         return q
+
+    def forward(self, x_seq: torch.Tensor, intents: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 1. Temporal self-attention
+        x_seq = self._self_attn_block(
+            x_seq,
+            self.temporal_sa_norm1, self.temporal_sa,
+            self.temporal_sa_norm2, self.temporal_sa_ffn,
+        )
+
+        # 2. Intent self-attention
+        intents = self._self_attn_block(
+            intents,
+            self.intent_sa_norm1, self.intent_sa,
+            self.intent_sa_norm2, self.intent_sa_ffn,
+        )
+
+        # 3. Intent×trajectory cross-attention
+        intents = self._cross_attn_block(
+            q=intents, kv=x_seq,
+            norm_q=self.intent_ca_norm1_q, norm_kv=self.intent_ca_norm1_kv,
+            attn=self.intent_ca,
+            norm2=self.intent_ca_norm2, ffn=self.intent_ca_ffn,
+        )
+
+        return x_seq, intents
+
+
+class VAEDecoderBlock(nn.Module):
+    """A single decoder block: Time SA → Time×Latent CA.
+
+    Stackable via nn.ModuleList to form a deep decoder.
+    """
+
+    def __init__(self,
+                 hidden_dim: int,
+                 num_heads: int = 8,
+                 dropout: float = 0.1) -> None:
+        super(VAEDecoderBlock, self).__init__()
+
+        # ---- Time self-attention block ----
+        self.sa_norm1 = nn.LayerNorm(hidden_dim)
+        self.sa = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads,
+                                         dropout=dropout, batch_first=False)
+        self.sa_norm2 = nn.LayerNorm(hidden_dim)
+        self.sa_ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+
+        # ---- Time×latent cross-attention block ----
+        self.ca_norm1_q = nn.LayerNorm(hidden_dim)
+        self.ca_norm1_kv = nn.LayerNorm(hidden_dim)
+        self.ca = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=num_heads,
+                                         dropout=dropout, batch_first=False)
+        self.ca_norm2 = nn.LayerNorm(hidden_dim)
+        self.ca_ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+        )
+
+    # ------------------------------------------------------------------
+    #  Helper: self-attention transformer block
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _self_attn_block(x: torch.Tensor,
+                         norm1: nn.LayerNorm,
+                         attn: nn.MultiheadAttention,
+                         norm2: nn.LayerNorm,
+                         ffn: nn.Sequential) -> torch.Tensor:
+        """Pre-Norm → Self-Attention → Residual → Pre-Norm → FFN → Residual."""
+        x_norm = norm1(x)
+        attn_out, _ = attn(x_norm, x_norm, x_norm)
+        x = x + attn_out
+        x = x + ffn(norm2(x))
+        return x
+
+    # ------------------------------------------------------------------
+    #  Helper: cross-attention transformer block
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _cross_attn_block(q: torch.Tensor,
+                          kv: torch.Tensor,
+                          norm_q: nn.LayerNorm,
+                          norm_kv: nn.LayerNorm,
+                          attn: nn.MultiheadAttention,
+                          norm2: nn.LayerNorm,
+                          ffn: nn.Sequential) -> torch.Tensor:
+        """Pre-Norm → Cross-Attention → Residual → Pre-Norm → FFN → Residual."""
+        q_norm = norm_q(q)
+        kv_norm = norm_kv(kv)
+        attn_out, _ = attn(q_norm, kv_norm, kv_norm)
+        q = q + attn_out
+        q = q + ffn(norm2(q))
+        return q
+
+    def forward(self, time_q: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        # 1. Time self-attention
+        time_q = self._self_attn_block(
+            time_q,
+            self.sa_norm1, self.sa,
+            self.sa_norm2, self.sa_ffn,
+        )
+
+        # 2. Time×latent cross-attention
+        time_q = self._cross_attn_block(
+            q=time_q, kv=z,
+            norm_q=self.ca_norm1_q, norm_kv=self.ca_norm1_kv,
+            attn=self.ca,
+            norm2=self.ca_norm2, ffn=self.ca_ffn,
+        )
+
+        return time_q
+
+
+class VAE(nn.Module):
+    """Variational Auto-Encoder for trajectory latent space encoding.
+
+    Encoder pipeline:
+      1. FourierEmbedding per timestep
+      2. N stacked VAEEncoderBlock (each: Temporal SA → Intent SA → Intent×Trajectory CA)
+      3. Reparameterization into latent variables Z
+
+    Decoder pipeline:
+      1. N stacked VAEDecoderBlock (each: Time SA → Time×Latent CA)
+      2. Shared MLP mapping to (x, y) coordinates
+
+    Every attention block follows Pre-Norm → Attention → Residual → Pre-Norm → FFN → Residual.
+    """
+
+    def __init__(self,
+                 hidden_dim: int,
+                 input_dim: int = 2,
+                 num_future_steps: int = 60,
+                 num_intents: int = 3,
+                 num_encoder_blocks: int = 2,
+                 num_decoder_blocks: int = 1,
+                 num_freq_bands: int = 64,
+                 num_heads: int = 8,
+                 dropout: float = 0.1) -> None:
+        super(VAE, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.input_dim = input_dim
+        self.num_future_steps = num_future_steps
+        self.num_intents = num_intents
+
+        # ---- Encoder: Fourier embedding ----
+        self.fourier_emb = FourierEmbedding(input_dim=input_dim, hidden_dim=hidden_dim,
+                                             num_freq_bands=num_freq_bands)
+
+        # ---- Encoder: Stacked VAEEncoderBlocks ----
+        self.encoder_blocks = nn.ModuleList([
+            VAEEncoderBlock(hidden_dim=hidden_dim, num_intents=num_intents,
+                            num_heads=num_heads, dropout=dropout)
+            for _ in range(num_encoder_blocks)
+        ])
+
+        self.intent_queries = nn.Parameter(torch.randn(num_intents, 1, hidden_dim))
+
+        # ---- Reparameterization (shared MLP, after all encoder blocks) ----
+        self.reparam_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim * 2),
+        )
+
+        # ---- Decoder: Stacked VAEDecoderBlocks ----
+        self.time_queries = nn.Parameter(torch.randn(num_future_steps, 1, hidden_dim))
+
+        self.decoder_blocks = nn.ModuleList([
+            VAEDecoderBlock(hidden_dim=hidden_dim, num_heads=num_heads, dropout=dropout)
+            for _ in range(num_decoder_blocks)
+        ])
+
+        # ---- Decoder: Coordinate mapping ----
+        self.decoder_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, input_dim),
+        )
+
+        self.apply(weight_init)
 
     def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode future trajectories into latent distribution parameters.
@@ -178,30 +310,13 @@ class VAE(nn.Module):
         x_emb = x_emb.view(N_a, T_f, self.hidden_dim)
         x_seq = x_emb.transpose(0, 1)  # [T_f, N_a, hidden_dim]
 
-        # 2. Temporal self-attention block
-        x_seq = self._self_attn_block(
-            x_seq,
-            self.temporal_sa_norm1, self.temporal_sa,
-            self.temporal_sa_norm2, self.temporal_sa_ffn,
-        )  # [T_f, N_a, hidden_dim]
-
-        # 3. Intent self-attention block (3 intents communicate first)
         intents = self.intent_queries.expand(-1, N_a, -1)  # [3, N_a, hidden_dim]
-        intents = self._self_attn_block(
-            intents,
-            self.intent_sa_norm1, self.intent_sa,
-            self.intent_sa_norm2, self.intent_sa_ffn,
-        )  # [3, N_a, hidden_dim]
 
-        # 4. Intent×trajectory cross-attention block
-        intents = self._cross_attn_block(
-            q=intents, kv=x_seq,
-            norm_q=self.intent_ca_norm1_q, norm_kv=self.intent_ca_norm1_kv,
-            attn=self.intent_ca,
-            norm2=self.intent_ca_norm2, ffn=self.intent_ca_ffn,
-        )  # [3, N_a, hidden_dim]
+        # 2. Stacked encoder blocks (x_seq flows through all blocks)
+        for enc_block in self.encoder_blocks:
+            x_seq, intents = enc_block(x_seq, intents)
 
-        # 5. Reparameterization
+        # 3. Reparameterization (shared MLP, after all encoder blocks)
         params = self.reparam_mlp(intents)  # [3, N_a, hidden_dim * 2]
         mu, logvar = torch.chunk(params, 2, dim=-1)  # each [3, N_a, hidden_dim]
 
@@ -222,18 +337,16 @@ class VAE(nn.Module):
         """
         N_a = z.size(1)
 
-        # Cross-attention: 60 time queries × 3 latent intents
+        # Expand learnable time queries (shared across all decoder blocks)
         time_q = self.time_queries.expand(-1, N_a, -1)  # [T_f, N_a, hidden_dim]
-        decoded = self._cross_attn_block(
-            q=time_q, kv=z,
-            norm_q=self.decoder_ca_norm1_q, norm_kv=self.decoder_ca_norm1_kv,
-            attn=self.decoder_ca,
-            norm2=self.decoder_ca_norm2, ffn=self.decoder_ca_ffn,
-        )  # [T_f, N_a, hidden_dim]
 
-        # MLP → coordinates
-        recon_seq = self.decoder_mlp(decoded)  # [T_f, N_a, 2]
-        recon_x = recon_seq.transpose(0, 1)    # [N_a, T_f, 2]
+        # 1. Stacked decoder blocks (Time SA → Time×Latent CA per block)
+        for dec_block in self.decoder_blocks:
+            time_q = dec_block(time_q, z)
+
+        # 2. MLP → coordinates
+        recon_seq = self.decoder_mlp(time_q)  # [T_f, N_a, 2]
+        recon_x = recon_seq.transpose(0, 1)   # [N_a, T_f, 2]
 
         return recon_x
 
