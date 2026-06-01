@@ -183,47 +183,37 @@ class QCNetDiTBlock(nn.Module):
         return x
 
 
-class AsymmetricVelocityHead(nn.Module):
-    """Asymmetric velocity prediction heads for low/mid/high frequency bands.
-
-    Low-freq:   2-layer MLP  (easiest to learn)
-    Mid-freq:   3-layer MLP
-    High-freq:  4-layer MLP  (hardest to learn)
+class SymmetricVelocityHead(nn.Module):
+    """Symmetric velocity prediction heads for orthogonal frequency bands.
+    All bands use an identical 3-layer MLP with LayerNorm + SiLU for ODE stability.
     """
+    def __init__(self, hidden_dim: int, output_dim: int, num_tokens: int = 3) -> None:
+        super(SymmetricVelocityHead, self).__init__()
+        
+        self.heads = nn.ModuleList([
+            self._build_head(hidden_dim, output_dim) for _ in range(num_tokens)
+        ])
 
-    def __init__(self, hidden_dim: int, output_dim: int) -> None:
-        super(AsymmetricVelocityHead, self).__init__()
-        self.head_low = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
+    def _build_head(self, hidden_dim: int, output_dim: int) -> nn.Sequential:
+ 
+        return nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
             nn.SiLU(),
-            nn.Linear(hidden_dim, output_dim),
-        )
-        self.head_mid = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
+
+            nn.Linear(hidden_dim * 2, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, output_dim),
-        )
-        self.head_high = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, output_dim),
+
+            nn.Linear(hidden_dim * 2, output_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [N_a, 3, H] -> velocity: [N_a, 3, H]"""
-        out_low = self.head_low(x[:, 0])
-        out_mid = self.head_mid(x[:, 1])
-        out_high = self.head_high(x[:, 2])
-        return torch.stack([out_low, out_mid, out_high], dim=1)
+        """x: [N_a, K, H] -> velocity: [N_a, K, H]"""
+        out_tokens = []
+        for i in range(x.size(1)):
+            out_tokens.append(self.heads[i](x[:, i]))
+        return torch.stack(out_tokens, dim=1)
 
 
 class QCNetFMDecoder(nn.Module):
@@ -280,7 +270,7 @@ class QCNetFMDecoder(nn.Module):
              for _ in range(num_layers)]
         )
 
-        self.to_vel = AsymmetricVelocityHead(hidden_dim=hidden_dim, output_dim=hidden_dim)
+        self.to_vel = SymmetricVelocityHead(hidden_dim=hidden_dim, output_dim=hidden_dim)
 
         # Trajectory scorer for multi-modal ranking
         self.scorer = TrajectoryScorer(
