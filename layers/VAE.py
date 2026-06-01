@@ -243,8 +243,8 @@ class VAE(nn.Module):
                  input_dim: int = 2,
                  num_future_steps: int = 60,
                  num_intents: int = 3,
-                 num_encoder_blocks: int = 2,
-                 num_decoder_blocks: int = 1,
+                 num_encoder_blocks: int = 3,
+                 num_decoder_blocks: int = 2,
                  num_freq_bands: int = 64,
                  num_heads: int = 8,
                  dropout: float = 0.1) -> None:
@@ -284,7 +284,9 @@ class VAE(nn.Module):
 
         # ---- Decoder: Coordinate mapping ----
         self.decoder_mlp = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim//2),
             nn.GELU(),
             nn.Linear(hidden_dim // 2, input_dim),
         )

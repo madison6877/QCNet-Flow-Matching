@@ -289,11 +289,11 @@ class QCNetFM(pl.LightningModule):
                 loss, loss_dict = self.vae_loss(recon_x, mu, logvar, target, mask=predict_mask)
 
             self.log('val_vae_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-            self.log('val_vae_recon', loss_dict['loss_recon'], prog_bar=False, on_step=False, on_epoch=True,
+            self.log('val_vae_recon', loss_dict['loss_recon'], prog_bar=True, on_step=False, on_epoch=True,
                      batch_size=1, sync_dist=True)
-            self.log('val_vae_kl', loss_dict['loss_kl'], prog_bar=False, on_step=False, on_epoch=True,
+            self.log('val_vae_kl', loss_dict['loss_kl'], prog_bar=True, on_step=False, on_epoch=True,
                      batch_size=1, sync_dist=True)
-            self.log('val_vae_ortho', loss_dict['ortho_aux'], prog_bar=False, on_step=False, on_epoch=True,
+            self.log('val_vae_ortho', loss_dict['ortho_aux'], prog_bar=True, on_step=False, on_epoch=True,
                      batch_size=1, sync_dist=True)
             return
 
@@ -522,7 +522,7 @@ class QCNetFM(pl.LightningModule):
         parser.add_argument('--scorer_only', action='store_true', default=False)
         parser.add_argument('--vae_only', action='store_true', default=False)
         parser.add_argument('--freeze_vae', action='store_true', default=False)
-        parser.add_argument('--vae_beta', type=float, default=0.1)
+        parser.add_argument('--vae_beta', type=float, default=0.01)
         parser.add_argument('--vae_gamma', type=float, default=3.0)
         parser.add_argument('--vae_num_intents', type=int, default=3)
         parser.add_argument('--pl2pl_radius', type=float, required=True)

@@ -28,7 +28,7 @@ import torch
 torch.set_float32_matmul_precision('high')
 
 if __name__ == '__main__':
-    pl.seed_everything(2024, workers=True)
+    pl.seed_everything(2026, workers=True)
 
     parser = ArgumentParser()
     parser.add_argument('--root', type=str, required=True)
@@ -84,7 +84,7 @@ if __name__ == '__main__':
         monitor_mode = 'min'
     model_checkpoint = ModelCheckpoint(monitor=monitor_metric, mode=monitor_mode, save_top_k=5, save_last=True, save_weights_only=False)
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
-    trainer = pl.Trainer(accumulate_grad_batches=5, precision='bf16-mixed',
+    trainer = pl.Trainer(accumulate_grad_batches=1, precision='bf16-mixed',
                          accelerator=args.accelerator, devices=args.devices,
                          callbacks=[model_checkpoint, lr_monitor], max_epochs=args.max_epochs)
 
