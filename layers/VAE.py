@@ -242,7 +242,7 @@ class VAE(nn.Module):
                  hidden_dim: int,
                  input_dim: int = 2,
                  num_future_steps: int = 60,
-                 num_intents: int = 3,
+                 num_intents: int = 4,
                  num_encoder_blocks: int = 3,
                  num_decoder_blocks: int = 2,
                  num_freq_bands: int = 64,

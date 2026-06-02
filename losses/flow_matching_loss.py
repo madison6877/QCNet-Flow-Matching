@@ -47,17 +47,7 @@ class FlowMatchingLoss(nn.Module):
                                      hidden_dim: int,
                                      device: torch.device,
                                      agent_batch: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """潜空间流匹配: 3 个独立噪声 + 共享扩散步长 t。
 
-        Args:
-            num_intents: K=3 频域 token 数量
-            N_a:         智能体数量
-            hidden_dim:  潜空间维度
-
-        Returns:
-            x_0: [N_a, num_intents, hidden_dim]  初始噪声
-            t:   [N_a]                            共享扩散步长 (per-agent)
-        """
         x_0 = torch.randn(N_a, num_intents, hidden_dim, device=device)
         if agent_batch is None:
             t = torch.rand(N_a, device=device)
@@ -91,47 +81,50 @@ class FlowMatchingLoss(nn.Module):
 class LatentFlowMatchingLoss(nn.Module):
     """潜空间多频段流匹配损失。
 
-    计算 3 个频段速度预测与目标速度的加权 MSE。
-    权重可通过 w_low / w_mid / w_high 调节各频段的重要性。
+    计算 K 个频段速度预测与目标速度的加权 MSE。
+    权重可通过 band_weights 调节各频段的重要性。
 
     Input:
-        pred:     [N_a, 3, H]  速度场预测 (DiT 输出)
-        z_target: [N_a, 3, H]  目标潜向量 (VAE Encoder 产物)
-        x_0:      [N_a, 3, H]  初始噪声
+        pred:     [N_a, K, H]  速度场预测 (DiT 输出)
+        z_target: [N_a, K, H]  目标潜向量 (VAE Encoder 产物)
+        x_0:      [N_a, K, H]  初始噪声
 
     Returns:
         loss: scalar  加权平方误差总和
     """
 
-    def __init__(self, w_low: float = 1.0, w_mid: float = 1.0, w_high: float = 1.0) -> None:
+    def __init__(self, band_weights: Optional[torch.Tensor] = None) -> None:
         super(LatentFlowMatchingLoss, self).__init__()
-        self.register_buffer('weights', torch.tensor([w_low, w_mid, w_high]))
+        if band_weights is not None:
+            self.register_buffer('weights', band_weights)
+        else:
+            self.weights = None
 
     def forward(self,
                 pred: torch.Tensor,
                 z_target: torch.Tensor,
                 x_0: torch.Tensor) -> Tuple[torch.Tensor, dict]:
+        K = pred.size(1)  # number of frequency bands / intents
+        
         # u_t = z_true - x_0  
-        u_t = z_target - x_0                           # [N_a, 3, H]
-        se = (pred - u_t).pow(2).sum(dim=-1)           # [N_a, 3]  
+        u_t = z_target - x_0                           # [N_a, K, H]
+        se = (pred - u_t).pow(2).sum(dim=-1)           # [N_a, K]  
         
-        # 🌟 先在 Batch 维度上求均值，防止 Batch Size 波动导致梯度爆炸
-        se_mean = se.mean(dim=0)                       # [3]
+        se_mean = se.mean(dim=0)                       # [K]
         
-        # 🌟 分别乘以各自的权重
-        loss_low = se_mean[0] * self.weights[0]
-        loss_mid = se_mean[1] * self.weights[1]
-        loss_high = se_mean[2] * self.weights[2]
+        if self.weights is not None:
+            # Ensure weights match K
+            if self.weights.size(0) != K:
+                raise ValueError(f'band_weights size {self.weights.size(0)} does not match num_intents {K}')
+            weighted_se = se_mean * self.weights
+        else:
+            weighted_se = se_mean
         
-        # 总 Loss
-        total_loss = loss_low + loss_mid + loss_high
+        total_loss = weighted_se.sum()
         
-        # 记录分离的各项 (使用 .detach() 剥离梯度，防止内存泄漏)
-        loss_dict = {
-            'low': loss_low.detach(),
-            'mid': loss_mid.detach(),
-            'high': loss_high.detach()
-        }
+        # Build loss dict with generic keys: band_0, band_1, ..., band_{K-1}
+        loss_dict = {}
+        for i in range(K):
+            loss_dict[f'band_{i}'] = weighted_se[i].detach()
         
-        # 返回总 loss 和 分项字典
         return total_loss, loss_dict

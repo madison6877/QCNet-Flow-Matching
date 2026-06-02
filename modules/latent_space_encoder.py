@@ -32,8 +32,8 @@ class LatentSpaceEncoder(nn.Module):
                  hidden_dim: int,
                  input_dim: int = 2,
                  num_future_steps: int = 60,
-                 num_intents: int = 3,
-                 num_freq_bands: int = 64,
+                 num_intents: int = 4,
+                 num_freq_bands: int = 48,
                  num_heads: int = 8,
                  dropout: float = 0.1) -> None:
         super(LatentSpaceEncoder, self).__init__()

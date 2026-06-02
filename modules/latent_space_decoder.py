@@ -18,7 +18,7 @@ from layers.VAE import VAE
 
 
 class LatentSpaceDecoder(nn.Module):
-    """封装 VAE Decoder 为独立模块，冻结参数。
+    """封装 VAE Decoder 为独立模块
 
     Input:  z [N_a, 3, H]   (batch-first, 流匹配产物)
     Output: traj [N_a, T_f, D]  (物理轨迹坐标)

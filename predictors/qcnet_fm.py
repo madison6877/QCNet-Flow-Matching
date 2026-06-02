@@ -37,6 +37,7 @@ from modules import QCNetEncoder
 from modules import QCNetFMDecoder
 from modules import LatentSpaceEncoder
 from modules import LatentSpaceDecoder
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 try:
     from av2.datasets.motion_forecasting.eval.submission import ChallengeSubmission
@@ -80,6 +81,7 @@ class QCNetFM(pl.LightningModule):
                  vae_beta: float = 0.1,
                  vae_gamma: float = 3.0,
                  vae_num_intents: int = 3,
+                 band_weights: Optional[list] = None,
                  **kwargs) -> None:
         super(QCNetFM, self).__init__()
         self.save_hyperparameters()
@@ -148,10 +150,14 @@ class QCNetFM(pl.LightningModule):
             num_heads=num_heads,
             head_dim=head_dim,
             dropout=dropout,
+            vae_num_intents=vae_num_intents,
         )
 
-        # Latent Flow Matching loss with configurable per-band weights
-        self.latent_fm_loss = LatentFlowMatchingLoss()
+        if band_weights is not None:
+            bw_tensor = torch.tensor(band_weights, dtype=torch.float32)
+        else:
+            bw_tensor = None
+        self.latent_fm_loss = LatentFlowMatchingLoss(band_weights=bw_tensor)
 
         self.latent_encoder = LatentSpaceEncoder(
             hidden_dim=hidden_dim,
@@ -220,10 +226,10 @@ class QCNetFM(pl.LightningModule):
 
         loss, loss_dict = self.latent_fm_loss(v_theta, z_target, x_0)
         
-        self.log('val_fm_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('v_low', loss_dict['low'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('v_mid', loss_dict['mid'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('v_high', loss_dict['high'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('train_fm_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
+        for k_name, v_loss in loss_dict.items():
+            self.log(f'train_{k_name}', v_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
+        
         return loss
 
     def _training_step_vae(self, data):
@@ -316,10 +322,9 @@ class QCNetFM(pl.LightningModule):
 
         loss, loss_dict = self.latent_fm_loss(v_theta, z_target, x_0)
         
-        self.log('val_fm_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('v_low', loss_dict['low'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('v_mid', loss_dict['mid'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-        self.log('v_high', loss_dict['high'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+        self.log('val_fm_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
+        for k_name, v_loss in loss_dict.items():
+            self.log(f'val_{k_name}', v_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
 
         # Stage 1: stop here, only evaluate FM velocity field loss
         if not self.scorer_only :
@@ -496,9 +501,39 @@ class QCNetFM(pl.LightningModule):
                  "weight_decay": 0.0},
             ]
         # else: default — optim_groups already built above from all params
-
         optimizer = torch.optim.AdamW(optim_groups, lr=self.lr, weight_decay=self.weight_decay)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=self.T_max, eta_min=0.0)
+        if getattr(self, 'vae_only', False):
+            warmup_epochs = 1  # Stage 0 (VAE): 梯度平稳，给 1 个 Epoch 象征性热身即可
+        elif getattr(self, 'scorer_only', False):
+            warmup_epochs = 1  # Stage 2 (Scorer): 只训练打分器，1 个 Epoch 足够
+        else:
+            warmup_epochs = 3  # Stage 1 (FM): 核心潜空间流匹配，必须给足 4 个 Epoch 防爆
+
+        # 2. 安全构建调度器 (拦截 warmup_epochs == 0 的致命异常)
+        if warmup_epochs > 0:
+            warmup_scheduler = LinearLR(
+                optimizer, 
+                start_factor=0.01, 
+                total_iters=warmup_epochs
+            )
+            cosine_scheduler = CosineAnnealingLR(
+                optimizer, 
+                T_max=self.T_max - warmup_epochs, 
+                eta_min=0.0
+            )
+            scheduler = SequentialLR(
+                optimizer, 
+                schedulers=[warmup_scheduler, cosine_scheduler], 
+                milestones=[warmup_epochs]
+            )
+        else:
+            # 如果某天你决定把某阶段的 warmup_epochs 设为 0，直接退化为纯余弦
+            scheduler = CosineAnnealingLR(
+                optimizer, 
+                T_max=self.T_max, 
+                eta_min=0.0
+            )
+            
         return [optimizer], [scheduler]
 
     @staticmethod
@@ -523,8 +558,9 @@ class QCNetFM(pl.LightningModule):
         parser.add_argument('--vae_only', action='store_true', default=False)
         parser.add_argument('--freeze_vae', action='store_true', default=False)
         parser.add_argument('--vae_beta', type=float, default=0.01)
-        parser.add_argument('--vae_gamma', type=float, default=3.0)
+        parser.add_argument('--vae_gamma', type=float, default=0.1)
         parser.add_argument('--vae_num_intents', type=int, default=3)
+        parser.add_argument('--band_weights', nargs='+', type=float, default=None, help='e.g. --band_weights 1.5 0.5 0.5 1.5')
         parser.add_argument('--pl2pl_radius', type=float, required=True)
         parser.add_argument('--time_span', type=int, default=None)
         parser.add_argument('--pl2a_radius', type=float, required=True)

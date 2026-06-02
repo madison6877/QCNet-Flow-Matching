@@ -80,10 +80,6 @@ class QCNetDiTBlock(nn.Module):
         super(QCNetDiTBlock, self).__init__()
         self.hidden_dim = hidden_dim
 
-        # ========================================================================
-        # 优化点 1 (算子融合): 将 5 个独立的 adaLN 融合成一个巨大的 Linear，
-        # 大幅减少 CUDA Kernel Launch，特别适合极宽的 5090
-        # ========================================================================
         self.adaLN_all = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 10))
 
         self.norm1 = nn.LayerNorm(hidden_dim)
@@ -147,14 +143,17 @@ class QCNetDiTBlock(nn.Module):
         x_flat = x.reshape(N_a * K, self.hidden_dim)                # [N_a*K, H]
         t_emb_flat = t_emb_s.reshape(N_a * K, self.hidden_dim)      # [N_a*K, H]
 
-        shift_scale_all = self.adaLN_all(t_emb_flat)
+        freq_emb_flat = freq_pos_emb.unsqueeze(0).expand(N_a, K, self.hidden_dim).reshape(N_a * K, self.hidden_dim)
+        cond = t_emb_flat + freq_emb_flat
+
+        shift_scale_all = self.adaLN_all(cond, context=None)
         ss1, ss2, ss3, ss4, ss5 = shift_scale_all.chunk(5, dim=-1)
 
         # Step 1: Frequency token self-attention (add learnable freq_pos_emb, then self-attend)
         shift1, scale1 = ss1.chunk(2, dim=-1)
         x_mod = self.norm1(x_flat) * (1.0 + scale1) + shift1
         x_seg = x_mod.reshape(N_a, K, self.hidden_dim)
-        seg_out = self.seg_attn(x=x_seg, context=freq_pos_emb)
+        seg_out = self.seg_attn(x=x_seg)
         x_flat = x_flat + seg_out.reshape(N_a * K, self.hidden_dim)
 
         # Step 2: Temporal cross-attention (t2a)
@@ -183,37 +182,58 @@ class QCNetDiTBlock(nn.Module):
         return x
 
 
-class SymmetricVelocityHead(nn.Module):
-    """Symmetric velocity prediction heads for orthogonal frequency bands.
-    All bands use an identical 3-layer MLP with LayerNorm + SiLU for ODE stability.
+class AsymmetricVelocityHead(nn.Module):
+    """Asymmetric velocity prediction heads based on latent Jerk profile.
+
+    Generalizes to any num_intents by using a ModuleList.
+    Pattern (for num_intents >= 3):
+      - Head 0 (Low Jerk / Macro): 2-layer MLP (Strong smoothing prior)
+      - Head 1..K-2 (High Jerk / Micro): 4-layer MLP (High capacity for noise/details)
+      - Head K-1 (Low Jerk / Macro): 2-layer MLP (Strong smoothing prior)
+
+    For num_intents == 2: both heads are 2-layer MLP
+    For num_intents == 1: single 4-layer MLP
     """
-    def __init__(self, hidden_dim: int, output_dim: int, num_tokens: int = 3) -> None:
-        super(SymmetricVelocityHead, self).__init__()
-        
-        self.heads = nn.ModuleList([
-            self._build_head(hidden_dim, output_dim) for _ in range(num_tokens)
-        ])
+    def __init__(self, hidden_dim: int, output_dim: int, num_intents: int = 3) -> None:
+        super(AsymmetricVelocityHead, self).__init__()
+        self.num_intents = num_intents
 
-    def _build_head(self, hidden_dim: int, output_dim: int) -> nn.Sequential:
- 
-        return nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.SiLU(),
+        def _make_low_jerk_head():
+            return nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim * 2),
+                nn.LayerNorm(hidden_dim * 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim * 2, output_dim),
+            )
 
-            nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.SiLU(),
+        def _make_high_jerk_head():
+            return nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim * 2),
+                nn.LayerNorm(hidden_dim * 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim * 2, hidden_dim * 2),
+                nn.LayerNorm(hidden_dim * 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim * 2, output_dim),
+            )
 
-            nn.Linear(hidden_dim * 2, output_dim),
-        )
+        if num_intents == 1:
+            self.heads = nn.ModuleList([_make_high_jerk_head()])
+        elif num_intents == 2:
+            self.heads = nn.ModuleList([_make_low_jerk_head(), _make_low_jerk_head()])
+        else:
+            heads = [_make_low_jerk_head()]
+            for _ in range(num_intents - 2):
+                heads.append(_make_high_jerk_head())
+            heads.append(_make_low_jerk_head())
+            self.heads = nn.ModuleList(heads)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [N_a, K, H] -> velocity: [N_a, K, H]"""
-        out_tokens = []
-        for i in range(x.size(1)):
-            out_tokens.append(self.heads[i](x[:, i]))
-        return torch.stack(out_tokens, dim=1)
+        outputs = [self.heads[i](x[:, i]) for i in range(self.num_intents)]
+        return torch.stack(outputs, dim=1)
 
 
 class QCNetFMDecoder(nn.Module):
@@ -231,7 +251,8 @@ class QCNetFMDecoder(nn.Module):
                  num_layers: int,
                  num_heads: int,
                  head_dim: int,
-                 dropout: float) -> None:
+                 dropout: float,
+                 vae_num_intents: int = 3) -> None:
         super(QCNetFMDecoder, self).__init__()
         self.dataset = dataset
         self.input_dim = input_dim
@@ -252,7 +273,7 @@ class QCNetFMDecoder(nn.Module):
         input_dim_r_pl2a = 3
         input_dim_r_a2a = 3
 
-        self.num_intents = 3  # K frequency tokens: low, mid, high
+        self.num_intents = vae_num_intents  # K frequency tokens: configurable via hyperparameter
 
         self.freq_pos_emb = nn.Parameter(torch.randn(self.num_intents, hidden_dim))
 
@@ -263,14 +284,15 @@ class QCNetFMDecoder(nn.Module):
         self.r_pl2a_emb = FourierEmbedding(input_dim=input_dim_r_pl2a, hidden_dim=hidden_dim,
                                            num_freq_bands=num_freq_bands)
         self.r_a2a_emb = FourierEmbedding(input_dim=input_dim_r_a2a, hidden_dim=hidden_dim,
-                                          num_freq_bands=num_freq_bands)
+                                           num_freq_bands=num_freq_bands)
 
         self.blocks = nn.ModuleList(
             [QCNetDiTBlock(hidden_dim=hidden_dim, num_heads=num_heads, head_dim=head_dim, dropout=dropout)
              for _ in range(num_layers)]
         )
 
-        self.to_vel = SymmetricVelocityHead(hidden_dim=hidden_dim, output_dim=hidden_dim)
+        self.to_vel = AsymmetricVelocityHead(hidden_dim=hidden_dim, output_dim=hidden_dim,
+                                             num_intents=self.num_intents)
 
         # Trajectory scorer for multi-modal ranking
         self.scorer = TrajectoryScorer(
@@ -392,8 +414,7 @@ class QCNetFMDecoder(nn.Module):
         # ---- Step 1: Time embedding (per-agent, shared across K tokens) ----
         if t.dim() == 0:
             t = t.unsqueeze(0)
-        t_emb = self.t_emb(continuous_inputs=t.unsqueeze(-1), categorical_embs=None)
-        t_emb = t_emb[ctx['agent_batch']]                           # [N_a, H]
+        t_emb = self.t_emb(continuous_inputs=t.unsqueeze(-1), categorical_embs=None)                          # [N_a, H]
         t_emb_s = t_emb.unsqueeze(1).expand(N_a, K, H)              # [N_a, K, H]
 
         # ---- Step 2: DiT blocks (K frequency tokens in parallel) ----
@@ -409,7 +430,7 @@ class QCNetFMDecoder(nn.Module):
                 r_a2a_exp=ctx['r_a2a_exp'], edge_index_a2a_exp=ctx['edge_index_a2a_exp'],
             )
 
-        # ---- Step 3: Asymmetric velocity output (3 separate heads) ----
+        # ---- Step 3: Asymmetric velocity output (K separate heads) ----
         v_theta = self.to_vel(x)  # [N_a, K, H]
 
         return v_theta
@@ -451,11 +472,9 @@ class QCNetFMDecoder(nn.Module):
         dt = 1.0 / num_steps
         t_grid = torch.linspace(0.0, 1.0 - dt, num_steps, device=device)
 
-        B = int(ctx['agent_batch'].max().item()) + 1 if ctx['agent_batch'].numel() > 0 else 1
-
         all_outputs: List[torch.Tensor] = []
-        t_cur_tensor = torch.empty(B, device=device)
-        t_next_tensor = torch.empty(B, device=device)
+        t_cur_tensor = torch.empty(N_a, device=device)
+        t_next_tensor = torch.empty(N_a, device=device)
 
         for _ in range(num_modes):
             # initial noise in latent space: x_0 ~ N(0, I)  → [N_a, K, H]

@@ -38,7 +38,7 @@ if __name__ == '__main__':
     parser.add_argument('--shuffle', type=bool, default=True)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--pin_memory', type=bool, default=True)
-    parser.add_argument('--persistent_workers', type=bool, default=True)
+    parser.add_argument('--persistent_workers', type=bool, default=False)
     parser.add_argument('--train_raw_dir', type=str, default=None)
     parser.add_argument('--val_raw_dir', type=str, default=None)
     parser.add_argument('--test_raw_dir', type=str, default=None)

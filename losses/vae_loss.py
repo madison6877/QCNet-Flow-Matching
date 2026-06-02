@@ -67,10 +67,14 @@ class VAELoss(nn.Module):
 
         # ---- Orthogonality penalty (intent disentanglement) ----
         # Compute pairwise cosine similarity among the 3 intent vectors.
-        mu_norm = F.normalize(mu, dim=-1)                               # [3, N_a, hidden_dim]
-        cos_sim = torch.einsum('inj,mnj->nim', mu_norm, mu_norm)        # [N_a, 3, 3]
-        mask = ~torch.eye(3, dtype=torch.bool, device=mu.device)        # exclude diagonal
-        ortho_loss = cos_sim.abs()[:, mask].mean()                      # scalar
+        K = mu.size(0)                                                  
+        if K > 1:
+            mu_norm = F.normalize(mu, dim=-1)                               
+            cos_sim = torch.einsum('inj,mnj->nim', mu_norm, mu_norm)        
+            mask = ~torch.eye(K, dtype=torch.bool, device=mu.device)        
+            ortho_loss = cos_sim.abs()[:, mask].mean()                      
+        else:
+            ortho_loss = torch.tensor(0.0, device=mu.device) # K=1 时没有正交性可言
 
         # ---- Total loss ----
         total_loss = recon_loss + self.beta * kl_loss + self.gamma * ortho_loss
