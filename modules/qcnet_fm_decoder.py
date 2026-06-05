@@ -80,13 +80,12 @@ class QCNetDiTBlock(nn.Module):
         super(QCNetDiTBlock, self).__init__()
         self.hidden_dim = hidden_dim
 
-        self.adaLN_all = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 10))
+        self.adaLN_all = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 16))
 
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.norm3 = nn.LayerNorm(hidden_dim)
         self.norm4 = nn.LayerNorm(hidden_dim)
-        self.norm5 = nn.LayerNorm(hidden_dim)
 
         self.t2a_attn = AttentionLayer(hidden_dim=hidden_dim, num_heads=num_heads, head_dim=head_dim,
                                        dropout=dropout, bipartite=True, has_pos_emb=True)
@@ -96,33 +95,24 @@ class QCNetDiTBlock(nn.Module):
                                        dropout=dropout, bipartite=False, has_pos_emb=True)
         self.seg_attn = TransformerLayer(hidden_dim=hidden_dim, num_heads=num_heads, dropout=dropout)
 
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, 4 * hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(4 * hidden_dim, hidden_dim),
-            nn.Dropout(dropout)
-        )
-
         self.apply(weight_init)
+
+        nn.init.zeros_(self.adaLN_all[-1].weight)
+        nn.init.zeros_(self.adaLN_all[-1].bias)
 
     @staticmethod
     def _expand_edge_index(edge_index: torch.Tensor, K: int, bipartite: bool) -> torch.Tensor:
         if edge_index is None:
             return None
         E = edge_index.size(1)
-
         offsets = torch.arange(K, device=edge_index.device, dtype=edge_index.dtype).repeat_interleave(E)
-
         dst_base = edge_index[1].repeat(K) * K
         dst = dst_base + offsets
-
         if bipartite:
             src = edge_index[0].repeat(K)
         else:
             src_base = edge_index[0].repeat(K) * K
             src = src_base + offsets
-
         return torch.stack([src, dst], dim=0)
 
     def forward(self,
@@ -140,47 +130,63 @@ class QCNetDiTBlock(nn.Module):
                 K: int) -> torch.Tensor:
         N_a = x.size(0)
 
-        x_flat = x.reshape(N_a * K, self.hidden_dim)                # [N_a*K, H]
-        t_emb_flat = t_emb_s.reshape(N_a * K, self.hidden_dim)      # [N_a*K, H]
+        x_flat = x.reshape(N_a * K, self.hidden_dim)                
+        t_emb_flat = t_emb_s.reshape(N_a * K, self.hidden_dim)      
 
         freq_emb_flat = freq_pos_emb.unsqueeze(0).expand(N_a, K, self.hidden_dim).reshape(N_a * K, self.hidden_dim)
         cond = t_emb_flat + freq_emb_flat
 
-        shift_scale_all = self.adaLN_all(cond, context=None)
-        ss1, ss2, ss3, ss4, ss5 = shift_scale_all.chunk(5, dim=-1)
+        shift_scale_all = self.adaLN_all(cond)
+        
+        ss1_attn, ss1_ffn, ss2_attn, ss2_ffn, ss3_attn, ss3_ffn, ss4_attn, ss4_ffn = shift_scale_all.chunk(8, dim=-1)
 
-        # Step 1: Frequency token self-attention (add learnable freq_pos_emb, then self-attend)
-        shift1, scale1 = ss1.chunk(2, dim=-1)
-        x_mod = self.norm1(x_flat) * (1.0 + scale1) + shift1
-        x_seg = x_mod.reshape(N_a, K, self.hidden_dim)
-        seg_out = self.seg_attn(x=x_seg)
-        x_flat = x_flat + seg_out.reshape(N_a * K, self.hidden_dim)
+        # Step 1: Temporal cross-attention
+        shift1_a, scale1_a = ss1_attn.chunk(2, dim=-1)
+        x_mod = self.norm1(x_flat) * (1.0 + scale1_a) + shift1_a
+        x_src_norm = self.t2a_attn.attn_prenorm_x_src(x_t)
+        r_norm = self.t2a_attn.attn_prenorm_r(r_t2a_exp) if (self.t2a_attn.has_pos_emb and r_t2a_exp is not None) else None
+        attn_out = self.t2a_attn._attn_block(x_src=x_src_norm, x_dst=x_mod, r=r_norm, edge_index=edge_index_t2a_exp)
+        x_flat = x_flat + attn_out
+        shift1_f, scale1_f = ss1_ffn.chunk(2, dim=-1)
+        ff_in = self.t2a_attn.ff_prenorm(x_flat) * (1.0 + scale1_f) + shift1_f
+        ff_out = self.t2a_attn._ff_block(ff_in)
+        x_flat = x_flat + ff_out
 
-        # Step 2: Temporal cross-attention (t2a)
-        shift2, scale2 = ss2.chunk(2, dim=-1)
-        x_mod = self.norm2(x_flat) * (1.0 + scale2) + shift2
-        x_flat = x_flat + self.t2a_attn((x_t, x_mod), r_t2a_exp, edge_index_t2a_exp)
+        # Step 2: Map cross-attention
+        shift2_a, scale2_a = ss2_attn.chunk(2, dim=-1)
+        x_mod = self.norm2(x_flat) * (1.0 + scale2_a) + shift2_a
+        x_src_norm = self.pl2a_attn.attn_prenorm_x_src(x_pl)
+        r_norm = self.pl2a_attn.attn_prenorm_r(r_pl2a_exp) if (self.pl2a_attn.has_pos_emb and r_pl2a_exp is not None) else None
+        attn_out = self.pl2a_attn._attn_block(x_src=x_src_norm, x_dst=x_mod, r=r_norm, edge_index=edge_index_pl2a_exp)
+        x_flat = x_flat + attn_out
+        shift2_f, scale2_f = ss2_ffn.chunk(2, dim=-1)
+        ff_in = self.pl2a_attn.ff_prenorm(x_flat) * (1.0 + scale2_f) + shift2_f
+        ff_out = self.pl2a_attn._ff_block(ff_in)
+        x_flat = x_flat + ff_out
 
-        # Step 3: Map cross-attention (pl2a)
-        shift3, scale3 = ss3.chunk(2, dim=-1)
-        x_mod = self.norm3(x_flat) * (1.0 + scale3) + shift3
-        x_flat = x_flat + self.pl2a_attn((x_pl, x_mod), r_pl2a_exp, edge_index_pl2a_exp)
+        # Step 3: Agent self-attention
+        shift3_a, scale3_a = ss3_attn.chunk(2, dim=-1)
+        x_mod = self.norm3(x_flat) * (1.0 + scale3_a) + shift3_a
+        r_norm = self.a2a_attn.attn_prenorm_r(r_a2a_exp) if (self.a2a_attn.has_pos_emb and r_a2a_exp is not None) else None
+        attn_out = self.a2a_attn._attn_block(x_src=x_mod, x_dst=x_mod, r=r_norm, edge_index=edge_index_a2a_exp)
+        x_flat = x_flat + attn_out
+        shift3_f, scale3_f = ss3_ffn.chunk(2, dim=-1)
+        ff_in = self.a2a_attn.ff_prenorm(x_flat) * (1.0 + scale3_f) + shift3_f  
+        ff_out = self.a2a_attn._ff_block(ff_in)
+        x_flat = x_flat + ff_out
 
-        # Step 4: Agent self-attention (a2a)
-        shift4, scale4 = ss4.chunk(2, dim=-1)
-        x_mod = self.norm4(x_flat) * (1.0 + scale4) + shift4
-        x_flat = x_flat + self.a2a_attn(x_mod, r_a2a_exp, edge_index_a2a_exp)
+        # Step 4: Frequency token self-attention
+        shift4_a, scale4_a = ss4_attn.chunk(2, dim=-1)
+        x_mod = self.norm4(x_flat) * (1.0 + scale4_a) + shift4_a
+        x_mod_seg = x_mod.reshape(N_a, K, self.hidden_dim)
+        attn_out, _ = self.seg_attn.attn(query=x_mod_seg, key=x_mod_seg, value=x_mod_seg, need_weights=False)
+        x_flat = x_flat + attn_out.reshape(N_a * K, self.hidden_dim)
+        shift4_f, scale4_f = ss4_ffn.chunk(2, dim=-1)
+        ff_in = self.seg_attn.ffn_prenorm(x_flat) * (1.0 + scale4_f) + shift4_f
+        ff_out = self.seg_attn.ffn(ff_in)
+        x_flat = x_flat + ff_out
 
-        # Step 5: Feed-Forward Network
-        shift5, scale5 = ss5.chunk(2, dim=-1)
-        x_mod = self.norm5(x_flat) * (1.0 + scale5) + shift5
-        x_flat = x_flat + self.ffn(x_mod)
-
-        # Reshape back to [N_a, K, H]
-        x = x_flat.reshape(N_a, K, self.hidden_dim)
-
-        return x
-
+        return x_flat.reshape(N_a, K, self.hidden_dim)
 
 class AsymmetricVelocityHead(nn.Module):
     """Asymmetric velocity prediction heads based on latent Jerk profile.
@@ -200,21 +206,16 @@ class AsymmetricVelocityHead(nn.Module):
 
         def _make_low_jerk_head():
             return nn.Sequential(
-                nn.LayerNorm(hidden_dim),
                 nn.Linear(hidden_dim, hidden_dim * 2),
-                nn.LayerNorm(hidden_dim * 2),
                 nn.GELU(),
                 nn.Linear(hidden_dim * 2, output_dim),
             )
 
         def _make_high_jerk_head():
             return nn.Sequential(
-                nn.LayerNorm(hidden_dim),
                 nn.Linear(hidden_dim, hidden_dim * 2),
-                nn.LayerNorm(hidden_dim * 2),
                 nn.GELU(),
                 nn.Linear(hidden_dim * 2, hidden_dim * 2),
-                nn.LayerNorm(hidden_dim * 2),
                 nn.GELU(),
                 nn.Linear(hidden_dim * 2, output_dim),
             )
@@ -275,7 +276,7 @@ class QCNetFMDecoder(nn.Module):
 
         self.num_intents = vae_num_intents  # K frequency tokens: configurable via hyperparameter
 
-        self.freq_pos_emb = nn.Parameter(torch.randn(self.num_intents, hidden_dim))
+        self.freq_pos_emb = nn.Parameter(0.5 * torch.randn(self.num_intents, hidden_dim))
 
         self.t_emb = FourierEmbedding(input_dim=1, hidden_dim=hidden_dim, num_freq_bands=num_freq_bands)
 

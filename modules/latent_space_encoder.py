@@ -48,7 +48,7 @@ class LatentSpaceEncoder(nn.Module):
         )
         self.apply(weight_init)
 
-    def forward(self, x: torch.Tensor, return_latent: bool = False) -> \
+    def forward(self, x: torch.Tensor, return_latent: bool = False, predict_mask: torch.Tensor = None) -> \
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         
         """Encode future trajectory, optionally decode for reconstruction.
@@ -58,18 +58,18 @@ class LatentSpaceEncoder(nn.Module):
             如果 return_latent=True  (流匹配训练): 返回 z, mu, logvar
         """
 
-        mu, logvar, z = self.vae.encode(x)
+        mu, logvar, z = self.vae.encode(x, predict_mask=predict_mask)
         if return_latent:
             return z, mu, logvar
         recon_x = self.vae.decode(z)
         return recon_x, mu, logvar
 
     @torch.no_grad()
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    def encode(self, x: torch.Tensor, predict_mask: torch.Tensor = None) -> torch.Tensor:
         """Encode trajectory → latent z (no gradient, mode preserved).
 
         Returns:
             z: [N_a, 3, H]  batch-first latent vectors
         """
-        mu, logvar, z = self.vae.encode(x)
-        return z.transpose(0, 1).contiguous()  # [3, N_a, H] → [N_a, 3, H]
+        mu, logvar, z = self.vae.encode(x, predict_mask=predict_mask)
+        return mu.transpose(0, 1).contiguous()  # [3, N_a, H] → [N_a, 3, H]

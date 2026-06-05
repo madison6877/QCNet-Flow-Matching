@@ -41,7 +41,9 @@ class TransformerLayer(nn.Module):
             batch_first=True,
         )
         self.attn_prenorm = nn.LayerNorm(hidden_dim)
+        self.attn_postnorm = nn.LayerNorm(hidden_dim)
         self.ffn_prenorm = nn.LayerNorm(hidden_dim)
+        self.ffn_postnorm = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
             nn.Linear(hidden_dim, 4 * hidden_dim),
             nn.GELU(),
@@ -78,9 +80,9 @@ class TransformerLayer(nn.Module):
             attn_out, _ = self.attn(
                 qk, qk, x_norm, need_weights=False
             )
-        x = x + attn_out
+        x = x + self.attn_postnorm(attn_out)
 
         # ---- Pre-norm FFN ----
-        x = x + self.ffn(self.ffn_prenorm(x))
+        x = x + self.ffn_postnorm(self.ffn(self.ffn_prenorm(x)))
 
         return x

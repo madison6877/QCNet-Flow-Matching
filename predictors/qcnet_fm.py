@@ -37,7 +37,7 @@ from modules import QCNetEncoder
 from modules import QCNetFMDecoder
 from modules import LatentSpaceEncoder
 from modules import LatentSpaceDecoder
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR, MultiStepLR
 
 try:
     from av2.datasets.motion_forecasting.eval.submission import ChallengeSubmission
@@ -164,6 +164,7 @@ class QCNetFM(pl.LightningModule):
             input_dim=output_dim,
             num_future_steps=num_future_steps,
             num_intents=vae_num_intents,
+            num_freq_bands=self.num_freq_bands,
         )
         self.latent_decoder = LatentSpaceDecoder(vae=self.latent_encoder.vae)
         self.vae_loss = VAELoss(beta=vae_beta, gamma=vae_gamma)
@@ -210,7 +211,7 @@ class QCNetFM(pl.LightningModule):
         # Encode ground-truth trajectory into 3 latent intent vectors [N_a, 3, H]
         self.latent_encoder.eval()
         with torch.no_grad():
-            z_target = self.latent_encoder.encode(target)  # [N_a, 3, H]
+            z_target = self.latent_encoder.encode(target, predict_mask=predict_mask)  # [N_a, 3, H]
 
         agent_batch = data['agent'].get('batch', None)
         x_0, t = FlowMatchingLoss.sample_noise_and_time_latent(
@@ -247,7 +248,7 @@ class QCNetFM(pl.LightningModule):
             target = target / 10.0
             predict_mask = data['agent']['predict_mask'][:, self.num_historical_steps:]
 
-        recon_x, mu, logvar = self.latent_encoder(target)
+        recon_x, mu, logvar = self.latent_encoder(target, predict_mask=predict_mask)
         loss, loss_dict = self.vae_loss(recon_x, mu, logvar, target, mask=predict_mask)
 
         self.log('train_vae_loss', loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
@@ -291,7 +292,7 @@ class QCNetFM(pl.LightningModule):
             predict_mask = data['agent']['predict_mask'][:, self.num_historical_steps:]
 
             with torch.no_grad():
-                recon_x, mu, logvar = self.latent_encoder(target)
+                recon_x, mu, logvar = self.latent_encoder(target, predict_mask=predict_mask)
                 loss, loss_dict = self.vae_loss(recon_x, mu, logvar, target, mask=predict_mask)
 
             self.log('val_vae_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
@@ -312,7 +313,7 @@ class QCNetFM(pl.LightningModule):
             scene_enc = self.encoder(data)
 
             # Encode target to latent for validation loss computation
-            z_target = self.latent_encoder.encode(target)  # [N_a, 3, H]
+            z_target = self.latent_encoder.encode(target, predict_mask=predict_mask)  # [N_a, 3, H]
 
             x_0, t = FlowMatchingLoss.sample_noise_and_time_latent(
                 self.vae_num_intents, target.size(0), self.hidden_dim, self.device, agent_batch)
@@ -509,7 +510,7 @@ class QCNetFM(pl.LightningModule):
         else:
             warmup_epochs = 3  # Stage 1 (FM): 核心潜空间流匹配，必须给足 4 个 Epoch 防爆
 
-        # 2. 安全构建调度器 (拦截 warmup_epochs == 0 的致命异常)
+        # 2. 安全构建调度器 (加入 VAE 与 FM 的调度分流)
         if warmup_epochs > 0:
             warmup_scheduler = LinearLR(
                 optimizer, 

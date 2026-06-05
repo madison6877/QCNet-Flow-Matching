@@ -79,10 +79,11 @@ class VAEEncoderBlock(nn.Module):
                          norm1: nn.LayerNorm,
                          attn: nn.MultiheadAttention,
                          norm2: nn.LayerNorm,
-                         ffn: nn.Sequential) -> torch.Tensor:
+                         ffn: nn.Sequential,
+                         key_padding_mask: torch.Tensor = None) -> torch.Tensor:
         """Pre-Norm → Self-Attention → Residual → Pre-Norm → FFN → Residual."""
         x_norm = norm1(x)
-        attn_out, _ = attn(x_norm, x_norm, x_norm)
+        attn_out, _ = attn(x_norm, x_norm, x_norm, key_padding_mask=key_padding_mask)
         x = x + attn_out
         x = x + ffn(norm2(x))
         return x
@@ -97,21 +98,23 @@ class VAEEncoderBlock(nn.Module):
                           norm_kv: nn.LayerNorm,
                           attn: nn.MultiheadAttention,
                           norm2: nn.LayerNorm,
-                          ffn: nn.Sequential) -> torch.Tensor:
+                          ffn: nn.Sequential,
+                          key_padding_mask: torch.Tensor = None) -> torch.Tensor:
         """Pre-Norm → Cross-Attention → Residual → Pre-Norm → FFN → Residual."""
         q_norm = norm_q(q)
         kv_norm = norm_kv(kv)
-        attn_out, _ = attn(q_norm, kv_norm, kv_norm)
+        attn_out, _ = attn(q_norm, kv_norm, kv_norm, key_padding_mask=key_padding_mask)
         q = q + attn_out
         q = q + ffn(norm2(q))
         return q
 
-    def forward(self, x_seq: torch.Tensor, intents: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x_seq: torch.Tensor, intents: torch.Tensor, key_padding_mask: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         # 1. Temporal self-attention
         x_seq = self._self_attn_block(
             x_seq,
             self.temporal_sa_norm1, self.temporal_sa,
             self.temporal_sa_norm2, self.temporal_sa_ffn,
+            key_padding_mask=key_padding_mask
         )
 
         # 2. Intent self-attention
@@ -127,6 +130,7 @@ class VAEEncoderBlock(nn.Module):
             norm_q=self.intent_ca_norm1_q, norm_kv=self.intent_ca_norm1_kv,
             attn=self.intent_ca,
             norm2=self.intent_ca_norm2, ffn=self.intent_ca_ffn,
+            key_padding_mask=key_padding_mask
         )
 
         return x_seq, intents
@@ -293,7 +297,7 @@ class VAE(nn.Module):
 
         self.apply(weight_init)
 
-    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def encode(self, x: torch.Tensor, predict_mask: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode future trajectories into latent distribution parameters.
 
         Args:
@@ -314,13 +318,21 @@ class VAE(nn.Module):
 
         intents = self.intent_queries.expand(-1, N_a, -1)  # [3, N_a, hidden_dim]
 
+        key_padding_mask = None
+        if predict_mask is not None:
+            valid_agent_mask = predict_mask.any(dim=1)
+            mask_bool = ~predict_mask.bool()
+            key_padding_mask = mask_bool
+            key_padding_mask[~valid_agent_mask] = False
+
         # 2. Stacked encoder blocks (x_seq flows through all blocks)
         for enc_block in self.encoder_blocks:
-            x_seq, intents = enc_block(x_seq, intents)
+            x_seq, intents = enc_block(x_seq, intents, key_padding_mask=key_padding_mask)
 
         # 3. Reparameterization (shared MLP, after all encoder blocks)
         params = self.reparam_mlp(intents)  # [3, N_a, hidden_dim * 2]
         mu, logvar = torch.chunk(params, 2, dim=-1)  # each [3, N_a, hidden_dim]
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
 
         # Sample z via reparameterization trick
         eps = torch.randn_like(mu)
