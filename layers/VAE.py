@@ -13,6 +13,8 @@
 # limitations under the License.
 from typing import Tuple
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -74,8 +76,7 @@ class VAEEncoderBlock(nn.Module):
     # ------------------------------------------------------------------
     #  Helper: self-attention transformer block
     # ------------------------------------------------------------------
-    @staticmethod
-    def _self_attn_block(x: torch.Tensor,
+    def _self_attn_block(self, x: torch.Tensor,
                          norm1: nn.LayerNorm,
                          attn: nn.MultiheadAttention,
                          norm2: nn.LayerNorm,
@@ -91,8 +92,7 @@ class VAEEncoderBlock(nn.Module):
     # ------------------------------------------------------------------
     #  Helper: cross-attention transformer block
     # ------------------------------------------------------------------
-    @staticmethod
-    def _cross_attn_block(q: torch.Tensor,
+    def _cross_attn_block(self, q: torch.Tensor,
                           kv: torch.Tensor,
                           norm_q: nn.LayerNorm,
                           norm_kv: nn.LayerNorm,
@@ -172,12 +172,12 @@ class VAEDecoderBlock(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
+        self.last_attn_weights = None
 
     # ------------------------------------------------------------------
     #  Helper: self-attention transformer block
     # ------------------------------------------------------------------
-    @staticmethod
-    def _self_attn_block(x: torch.Tensor,
+    def _self_attn_block(self, x: torch.Tensor,
                          norm1: nn.LayerNorm,
                          attn: nn.MultiheadAttention,
                          norm2: nn.LayerNorm,
@@ -192,8 +192,7 @@ class VAEDecoderBlock(nn.Module):
     # ------------------------------------------------------------------
     #  Helper: cross-attention transformer block
     # ------------------------------------------------------------------
-    @staticmethod
-    def _cross_attn_block(q: torch.Tensor,
+    def _cross_attn_block(self,q: torch.Tensor,
                           kv: torch.Tensor,
                           norm_q: nn.LayerNorm,
                           norm_kv: nn.LayerNorm,
@@ -203,7 +202,8 @@ class VAEDecoderBlock(nn.Module):
         """Pre-Norm → Cross-Attention → Residual → Pre-Norm → FFN → Residual."""
         q_norm = norm_q(q)
         kv_norm = norm_kv(kv)
-        attn_out, _ = attn(q_norm, kv_norm, kv_norm)
+        attn_out, attn_weights = attn(q_norm, kv_norm, kv_norm)
+        self.last_attn_weights = attn_weights
         q = q + attn_out
         q = q + ffn(norm2(q))
         return q
@@ -249,7 +249,7 @@ class VAE(nn.Module):
                  num_future_steps: int = 60,
                  num_intents: int = 4,
                  num_encoder_blocks: int = 2,
-                 num_decoder_blocks: int = 1,
+                 num_decoder_blocks: int = 2,
                  num_freq_bands: int = 64,
                  num_heads: int = 8,
                  dropout: float = 0.1) -> None:
@@ -261,7 +261,7 @@ class VAE(nn.Module):
         self.latent_dim = latent_dim
 
         # ---- Encoder: Fourier embedding ----
-        self.fourier_emb = FourierEmbedding(input_dim=input_dim, hidden_dim=hidden_dim,
+        self.fourier_emb = FourierEmbedding(input_dim=input_dim*2, hidden_dim=hidden_dim,
                                              num_freq_bands=num_freq_bands)
 
         # ---- Encoder: Stacked VAEEncoderBlocks ----
@@ -271,7 +271,20 @@ class VAE(nn.Module):
             for _ in range(num_encoder_blocks)
         ])
 
-        self.intent_queries = nn.Parameter(torch.randn(num_intents, 1, hidden_dim))
+        pe = torch.zeros(num_future_steps, hidden_dim)
+        position = torch.arange(0, num_future_steps, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, hidden_dim, 2).float() * (-math.log(10000.0) / hidden_dim))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(1) # [T_f, 1, hidden_dim]
+        self.register_buffer('time_pe', pe) # 注册 buffer，使其随模型保存但不参与梯度更新
+        
+        # 2. 可学习的时间查询基座 (保持不变)
+        self.time_queries_base = nn.Parameter(torch.randn(num_future_steps, 1, hidden_dim) * 0.1)
+
+        self.register_buffer('time_pe', pe)
+
+        self.intent_queries = nn.Parameter(torch.randn(num_intents, 1, hidden_dim) * 0.1)
 
         # ---- Reparameterization (shared MLP, after all encoder blocks) ----
         self.reparam_mlp = nn.Sequential(
@@ -311,10 +324,14 @@ class VAE(nn.Module):
             logvar: [3, N_a, hidden_dim]
             z:      [3, N_a, hidden_dim] sampled latent variables.
         """
-        N_a, T_f, _ = x.shape
+        N_a, T_f, D = x.shape
+
+        vel = torch.cat([torch.zeros(N_a, 1, D, device=x.device), 
+                         x[:, 1:, :] - x[:, :-1, :]], dim=1)
+        x_augmented = torch.cat([x, vel], dim=-1)
 
         # 1. FourierEmbedding per timestep
-        x_flat = x.view(N_a * T_f, self.input_dim)
+        x_flat = x_augmented.view(N_a * T_f, self.input_dim * 2)
         x_emb = self.fourier_emb(continuous_inputs=x_flat, categorical_embs=None)
         x_emb = x_emb.view(N_a, T_f, self.hidden_dim)
         x_seq = x_emb.transpose(0, 1)  # [T_f, N_a, hidden_dim]
@@ -356,10 +373,18 @@ class VAE(nn.Module):
             recon_x: [N_a, T_f, 2] reconstructed trajectories.
         """
         N_a = z.size(1)
+        # 🌟 强行打破垄断：训练阶段，随机“遮蔽”或“打乱” Token
+        if self.training:
+            # 策略：30% 的概率随机扔掉部分 Token，强迫解码器寻找其他信息来源
+            # 这是一个简单的 Dropout 变种，但作用在潜空间 Token 上
+            if torch.rand(1) < 0.2:
+                # 随机选择一个 Token 索引进行屏蔽
+                drop_idx = torch.randint(0, self.num_intents, (1,)).item()
+                z[drop_idx, :, :] = 0
         z = self.z_proj(z)  # [3, N_a, hidden_dim] → projected to hidden_dim for cross-attention
 
         # Expand learnable time queries (shared across all decoder blocks)
-        time_q = self.time_queries.expand(-1, N_a, -1)  # [T_f, N_a, hidden_dim]
+        time_q = (self.time_queries_base + self.time_pe).expand(-1, N_a, -1)  # [T_f, N_a, hidden_dim]
 
         # 1. Stacked decoder blocks (Time SA → Time×Latent CA per block)
         for dec_block in self.decoder_blocks:

@@ -69,7 +69,9 @@ def main():
     print("="*50)
     
     with torch.no_grad():
-        z_target = model.latent_encoder.encode(target) 
+        z_target = model.latent_encoder.encode(target)
+        z_norm = z_target.norm(dim=-1).mean(dim=1) # [K]
+        print(f"📊 Token Norms (每个意图的平均激活强度): {z_norm}") 
         
         # 寻找需要预测的主车 (category == 3)
         eval_mask = data['agent']['category'] == 3
@@ -125,6 +127,51 @@ def main():
             
             print(f"👉 替换 Token {i} 后主车的平均急动度 (Jerk): {jerk_magnitude:.6f}")
             isolated_trajs.append(traj_iso[agent_idx].cpu().numpy() * 10.0)
+
+    # 在 profile.py 中，循环结束后增加可视化代码
+
+    # 假设你已经有了 isolated_trajs
+    # 1. 提取第一个 Decoder Block 的注意力权重
+    # 注意：你的 decoder_blocks 是一个 ModuleList
+    first_decoder_block = model.latent_decoder.vae.decoder_blocks[0]
+    # 1. 拦截原始权重
+    weights = first_decoder_block.last_attn_weights # 形状应该是 [Batch, Heads, Tgt, Src]
+    print(f"DEBUG: 原始权重形状: {weights.shape}")
+
+    # 2. 我们只需要 [Tgt, Src] (例如 [60, K])
+    # 策略：取第一个 batch，然后对 Heads (维度1) 求平均
+    attn_map = weights[0].mean(dim=0) 
+    print(f"DEBUG: 对 Heads 求平均后形状: {attn_map.shape}")
+
+    # 3. 核心：转为 Numpy 并检查维度
+    attn_map_np = attn_map.detach().cpu().numpy()
+
+    # 如果形状是 (2,)，说明它变成了一维数组，我们需要看看它到底是什么
+    if attn_map_np.ndim != 2:
+        print(f"❌ 警告：依然不是 2D 矩阵！当前形状: {attn_map_np.shape}")
+        print(f"内容: {attn_map_np}") # 打印内容看看
+    
+    # 强制修正逻辑：
+    # 如果只有两个维度但不是 [60, K]，尝试强行 reshape
+    # 假设你的目标是 [60, K]，如果不是，请根据打印出来的形状手动调整
+    if attn_map_np.size == 120: # 60 * 2 = 120
+         attn_map_np = attn_map_np.reshape(60, 2)
+    else:
+         # 如果完全不知道形状，把所有维度展平后再 reshape 试试
+         attn_map_np = attn_map_np.reshape(-1, attn_map_np.shape[-1] if attn_map_np.ndim > 1 else 1)
+
+    # 4. 只有确保了是 2D 才能画图
+    if attn_map_np.ndim == 2:
+        plt.figure(figsize=(8, 6))
+        plt.imshow(attn_map_np, cmap='viridis', aspect='auto')
+        plt.colorbar(label='Attention Weight')
+        plt.title(f"Cross-Attention Map (Time vs Intents)")
+        plt.xlabel("Intent Tokens")
+        plt.ylabel("Time Steps")
+        plt.savefig("attention_heatmap.png", dpi=300)
+        print("✅ 热力图成功保存: attention_heatmap.png")
+    else:
+        print(f"❌ 无法画图，因为 reshape 后维度依然是 {attn_map_np.ndim}")
             
         # 💡 画图时，建议把 donor_idx 的真实轨迹也画在背景里作为参考！
     # ================= 画图模块 (动态自适应版) =================

@@ -329,7 +329,7 @@ class QCNetFM(pl.LightningModule):
             z_target = self.latent_encoder.encode(target, predict_mask=predict_mask)  # [N_a, 3, H]
 
             x_0, t = FlowMatchingLoss.sample_noise_and_time_latent(
-                self.vae_num_intents, target.size(0), self.hidden_dim, self.device, agent_batch)
+                self.vae_num_intents, target.size(0), self.latent_dim, self.device, agent_batch)
             t_exp = t[:, None, None]
             x_t = (1 - t_exp) * x_0 + t_exp * z_target
             v_theta = self(data, scene_enc, x_t, t)
