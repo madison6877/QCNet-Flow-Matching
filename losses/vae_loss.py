@@ -43,38 +43,48 @@ class VAELoss(nn.Module):
                 target_x: torch.Tensor,
                 mask: torch.Tensor = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
       
-        # ---- Reconstruction loss (scale-aligned with KL) ----
-        # Sum over trajectory steps and coordinate dims, mean over agents.
-        recon_loss = F.mse_loss(recon_x, target_x, reduction='none')  # [N_a, T_f, D]
+        # 先算原始的 MSE 矩阵 (不求和)
+        recon_loss_raw = F.mse_loss(recon_x, target_x, reduction='none')  # [N_a, T_f, D]
 
         if mask is not None:
-            # mask: [N_a, T_f]  (1 for valid, 0 for padding)
-            # Dynamic weight compensation: scale short trajectories up to match
-            # the element count of full-length trajectories, keeping recon on par
-            # with the constant per-agent KL (288 elements).
-            valid_elements = mask.sum(dim=1) * recon_x.size(2)          # [N_a] — valid coords per agent
-            per_elem_sum = (recon_loss * mask.unsqueeze(-1)).sum(dim=(1, 2))  # [N_a] — valid sum
-            per_elem_mean = per_elem_sum / valid_elements.clamp(min=1)        # [N_a] — per-coord mean
-            max_elements = float(recon_x.size(1) * recon_x.size(2))           # T_f * D
-            recon_loss = (per_elem_mean * max_elements).mean()                # unified-scale batch mean
-        else:
-            recon_loss = recon_loss.sum(dim=(1, 2)).mean()                    # original behaviour
+            # 🌟 核心拦截：精准揪出有效的 Agent
+            valid_agent_mask = mask.any(dim=-1) # [N_a] 
+            # 真正的分母：有效 Agent 的数量
+            num_valid_agents = valid_agent_mask.sum().clamp(min=1) 
 
-        # ---- KL divergence (standard VAE reduction) ----
-        # Sum over intent dim (0) and feature dim (2), mean over agents (1).
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(),
-                                   dim=(0, 2)).mean()                  # scalar
+            # ---- 1. Recon 重构损失计算 ----
+            # 每个 agent 的所有有效坐标点 MSE 总和，然后对有效 agent 取平均
+            per_elem_sum = (recon_loss_raw * mask.unsqueeze(-1)).sum(dim=(1, 2))
+            recon_loss = per_elem_sum[valid_agent_mask].mean()
 
-        # ---- Orthogonality penalty (intent disentanglement) ----
-        # Compute pairwise cosine similarity among the 3 intent vectors.
-        K = mu.size(0)                                                  
-        if K > 1:
-            mu_norm = F.normalize(mu, dim=-1)                               
-            cos_sim = torch.einsum('inj,mnj->nim', mu_norm, mu_norm)        
-            mask = ~torch.eye(K, dtype=torch.bool, device=mu.device)        
-            ortho_loss = cos_sim.abs()[:, mask].mean()                      
+            # ---- 2. KL 散度损失计算 ----
+            kl_per_agent = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=(0, 2))
+            # 🌟 过滤掉垃圾数据的 KL！
+            kl_loss = kl_per_agent[valid_agent_mask].sum() / num_valid_agents
+
+            # ---- 3. 正交约束损失计算 ----
+            K = mu.size(0)                                                  
+            if K > 1:
+                mu_norm = F.normalize(mu, dim=-1)                               
+                cos_sim = torch.einsum('inj,mnj->nim', mu_norm, mu_norm)        
+                ortho_mask = ~torch.eye(K, dtype=torch.bool, device=mu.device)        
+                ortho_per_agent = cos_sim.abs()[:, ortho_mask].mean(dim=-1)
+                ortho_loss = ortho_per_agent[valid_agent_mask].sum() / num_valid_agents                      
+            else:
+                ortho_loss = torch.tensor(0.0, device=mu.device)
+                
         else:
-            ortho_loss = torch.tensor(0.0, device=mu.device) # K=1 时没有正交性可言
+            # Fallback 逻辑保持原样
+            recon_loss = recon_loss_raw.sum(dim=(1, 2)).mean()
+            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=(0, 2)).mean()
+            K = mu.size(0)
+            if K > 1:
+                mu_norm = F.normalize(mu, dim=-1)
+                cos_sim = torch.einsum('inj,mnj->nim', mu_norm, mu_norm)
+                ortho_mask = ~torch.eye(K, dtype=torch.bool, device=mu.device)
+                ortho_loss = cos_sim.abs()[:, ortho_mask].mean()
+            else:
+                ortho_loss = torch.tensor(0.0, device=mu.device)
 
         # ---- Total loss ----
         total_loss = recon_loss + self.beta * kl_loss + self.gamma * ortho_loss

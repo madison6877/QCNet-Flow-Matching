@@ -244,11 +244,12 @@ class VAE(nn.Module):
 
     def __init__(self,
                  hidden_dim: int,
+                 latent_dim: int = 16,
                  input_dim: int = 2,
                  num_future_steps: int = 60,
                  num_intents: int = 4,
-                 num_encoder_blocks: int = 3,
-                 num_decoder_blocks: int = 2,
+                 num_encoder_blocks: int = 2,
+                 num_decoder_blocks: int = 1,
                  num_freq_bands: int = 64,
                  num_heads: int = 8,
                  dropout: float = 0.1) -> None:
@@ -257,6 +258,7 @@ class VAE(nn.Module):
         self.input_dim = input_dim
         self.num_future_steps = num_future_steps
         self.num_intents = num_intents
+        self.latent_dim = latent_dim
 
         # ---- Encoder: Fourier embedding ----
         self.fourier_emb = FourierEmbedding(input_dim=input_dim, hidden_dim=hidden_dim,
@@ -273,12 +275,13 @@ class VAE(nn.Module):
 
         # ---- Reparameterization (shared MLP, after all encoder blocks) ----
         self.reparam_mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.Linear(hidden_dim // 2, latent_dim * 2),
         )
 
         # ---- Decoder: Stacked VAEDecoderBlocks ----
+        self.z_proj = nn.Linear(self.latent_dim, hidden_dim)
         self.time_queries = nn.Parameter(torch.randn(num_future_steps, 1, hidden_dim))
 
         self.decoder_blocks = nn.ModuleList([
@@ -332,11 +335,14 @@ class VAE(nn.Module):
         # 3. Reparameterization (shared MLP, after all encoder blocks)
         params = self.reparam_mlp(intents)  # [3, N_a, hidden_dim * 2]
         mu, logvar = torch.chunk(params, 2, dim=-1)  # each [3, N_a, hidden_dim]
-        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+        logvar = torch.clamp(logvar, min=-4.0)
 
         # Sample z via reparameterization trick
-        eps = torch.randn_like(mu)
-        z = mu + eps * torch.exp(0.5 * logvar)
+        if self.training:
+            eps = torch.randn_like(mu)
+            z = mu + eps * torch.exp(0.5 * logvar)
+        else:
+            z = mu
 
         return mu, logvar, z
 
@@ -350,6 +356,7 @@ class VAE(nn.Module):
             recon_x: [N_a, T_f, 2] reconstructed trajectories.
         """
         N_a = z.size(1)
+        z = self.z_proj(z)  # [3, N_a, hidden_dim] → projected to hidden_dim for cross-attention
 
         # Expand learnable time queries (shared across all decoder blocks)
         time_q = self.time_queries.expand(-1, N_a, -1)  # [T_f, N_a, hidden_dim]

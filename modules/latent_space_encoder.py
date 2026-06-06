@@ -30,6 +30,7 @@ class LatentSpaceEncoder(nn.Module):
 
     def __init__(self,
                  hidden_dim: int,
+                 latent_dim: int = 16,
                  input_dim: int = 2,
                  num_future_steps: int = 60,
                  num_intents: int = 4,
@@ -39,6 +40,7 @@ class LatentSpaceEncoder(nn.Module):
         super(LatentSpaceEncoder, self).__init__()
         self.vae = VAE(
             hidden_dim=hidden_dim,
+            latent_dim = latent_dim,
             input_dim=input_dim,
             num_future_steps=num_future_steps,
             num_intents=num_intents,

@@ -28,7 +28,7 @@ import torch
 torch.set_float32_matmul_precision('high')
 
 if __name__ == '__main__':
-    pl.seed_everything(2026, workers=True)
+    pl.seed_everything(2027, workers=True)
 
     parser = ArgumentParser()
     parser.add_argument('--root', type=str, required=True)
@@ -36,7 +36,7 @@ if __name__ == '__main__':
     parser.add_argument('--val_batch_size', type=int, required=True)
     parser.add_argument('--test_batch_size', type=int, required=True)
     parser.add_argument('--shuffle', type=bool, default=True)
-    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--num_workers', type=int, default=14)
     parser.add_argument('--pin_memory', type=bool, default=True)
     parser.add_argument('--persistent_workers', type=bool, default=False)
     parser.add_argument('--train_raw_dir', type=str, default=None)

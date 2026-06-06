@@ -132,20 +132,27 @@ def compute_vae_target(position: torch.Tensor,
 
 def prepare_vae_data(processed_dir: str,
                      vae_dir: str,
-                     num_historical_steps: int = 50,
-                     output_dim: int = 2) -> None:
+                     target_builder=None) -> None:
     """
-    一次性后处理：遍历所有已处理的 .pkl 文件，提取 VAE 所需的 target 和 predict_mask，
+    一次性后处理：遍历所有已处理的 .pkl 文件，使用 TargetBuilder 生成 target，
     存为微型 .pt 文件（每场景约 24KB，vs 原始 .pkl 的几 MB）。
+
+    关键：与 validation 使用完全相同的 TargetBuilder，确保 train/val 的 target 一致。
 
     调用时机：VAE 训练开始前执行一次。如果 vae_dir 中已有足够多的 .pt 文件则跳过。
 
     Args:
         processed_dir: 已处理数据目录（包含 *.pkl 文件）
         vae_dir:       VAE 轻量数据输出目录
-        num_historical_steps: 历史时间步数
-        output_dim:           输出维度
+        target_builder: TargetBuilder 实例，用于生成与 validation 一致的 target
     """
+    if target_builder is None:
+        raise ValueError(
+            "target_builder must be a TargetBuilder instance to ensure "
+            "train/val target consistency."
+        )
+    from torch_geometric.data import HeteroData
+
     os.makedirs(vae_dir, exist_ok=True)
 
     pkl_files = sorted(glob(os.path.join(processed_dir, '*.pkl')))
@@ -154,7 +161,7 @@ def prepare_vae_data(processed_dir: str,
 
     # 检查是否已有足够的 .pt 文件（允许跳过已完成的后处理）
     existing_pt = set(os.path.splitext(os.path.basename(f))[0]
-                      for f in glob(os.path.join(vae_dir, '*.pt')))
+                       for f in glob(os.path.join(vae_dir, '*.pt')))
     pkl_ids = [os.path.splitext(os.path.basename(f))[0] for f in pkl_files]
     missing = [f for f, fid in zip(pkl_files, pkl_ids) if fid not in existing_pt]
 
@@ -162,24 +169,31 @@ def prepare_vae_data(processed_dir: str,
         print(f"[VAE Prep] All {len(pkl_files)} scenes already processed in {vae_dir}, skipping.")
         return
 
+    num_historical_steps = target_builder.num_historical_steps
+
     print(f"[VAE Prep] Processing {len(missing)}/{len(pkl_files)} scenes into {vae_dir} ...")
     for pkl_path in tqdm(missing, desc='VAE Prep'):
         with open(pkl_path, 'rb') as f:
             data = pickle.load(f)
 
-        agent_data = data['agent']
-        result = compute_vae_target(
-            position=agent_data['position'],
-            heading=agent_data['heading'],
-            velocity=agent_data['velocity'],
-            valid_mask=agent_data['valid_mask'],
-            predict_mask=agent_data['predict_mask'],
-            num_historical_steps=num_historical_steps,
-            output_dim=output_dim,
-        )
+        # 反序列化 HeteroData 并用 TargetBuilder 生成与 validation 一致的 target
+        hetero_data = HeteroData()
+        for key in data:
+            hetero_data[key] = data[key]
+        hetero_data = target_builder(hetero_data)
+
+        target = hetero_data['agent']['target'][..., :2]
+        predict_mask = hetero_data['agent']['predict_mask'][:, num_historical_steps:]
+
+        # 🌟 与 validation_step 保持完全一致：过滤掉 current_step 无效的 agent
+        current_valid_mask = hetero_data['agent']['valid_mask'][:, num_historical_steps - 1]
+        predict_mask = predict_mask.clone()
+        predict_mask[~current_valid_mask] = False
 
         # 应用 /10.0 归一化（与 training_step 中一致）
-        result['target'] = result['target'] / 10.0
+        target = target / 10.0
+
+        result = {'target': target, 'predict_mask': predict_mask}
 
         scene_id = os.path.splitext(os.path.basename(pkl_path))[0]
         torch.save(result, os.path.join(vae_dir, f'{scene_id}.pt'))

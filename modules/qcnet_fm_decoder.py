@@ -204,32 +204,17 @@ class AsymmetricVelocityHead(nn.Module):
         super(AsymmetricVelocityHead, self).__init__()
         self.num_intents = num_intents
 
-        def _make_low_jerk_head():
+        def _make_head():
             return nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim * 2),
                 nn.GELU(),
                 nn.Linear(hidden_dim * 2, output_dim),
             )
-
-        def _make_high_jerk_head():
-            return nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim * 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim * 2, hidden_dim * 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim * 2, output_dim),
-            )
-
-        if num_intents == 1:
-            self.heads = nn.ModuleList([_make_high_jerk_head()])
-        elif num_intents == 2:
-            self.heads = nn.ModuleList([_make_low_jerk_head(), _make_low_jerk_head()])
-        else:
-            heads = [_make_low_jerk_head()]
-            for _ in range(num_intents - 2):
-                heads.append(_make_high_jerk_head())
-            heads.append(_make_low_jerk_head())
-            self.heads = nn.ModuleList(heads)
+        
+        heads = [_make_head()]
+        for _ in range(num_intents - 1):
+            heads.append(_make_head())
+        self.heads = nn.ModuleList(heads)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [N_a, K, H] -> velocity: [N_a, K, H]"""
@@ -242,6 +227,7 @@ class QCNetFMDecoder(nn.Module):
                  dataset: str,
                  input_dim: int,
                  hidden_dim: int,
+                 latent_dim: int,
                  output_dim: int,
                  num_historical_steps: int,
                  num_future_steps: int,
@@ -258,6 +244,7 @@ class QCNetFMDecoder(nn.Module):
         self.dataset = dataset
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
         self.output_dim = output_dim
         self.num_historical_steps = num_historical_steps
         self.num_future_steps = num_future_steps
@@ -276,6 +263,8 @@ class QCNetFMDecoder(nn.Module):
 
         self.num_intents = vae_num_intents  # K frequency tokens: configurable via hyperparameter
 
+        self.x_proj_in = nn.Linear(self.latent_dim, self.hidden_dim)
+
         self.freq_pos_emb = nn.Parameter(0.5 * torch.randn(self.num_intents, hidden_dim))
 
         self.t_emb = FourierEmbedding(input_dim=1, hidden_dim=hidden_dim, num_freq_bands=num_freq_bands)
@@ -292,7 +281,7 @@ class QCNetFMDecoder(nn.Module):
              for _ in range(num_layers)]
         )
 
-        self.to_vel = AsymmetricVelocityHead(hidden_dim=hidden_dim, output_dim=hidden_dim,
+        self.to_vel = AsymmetricVelocityHead(hidden_dim=hidden_dim, output_dim=latent_dim,
                                              num_intents=self.num_intents)
 
         # Trajectory scorer for multi-modal ranking
@@ -403,7 +392,7 @@ class QCNetFMDecoder(nn.Module):
 
         Args:
             ctx:  pre-computed graph context from _build_graph_context
-            x_t:  [N_a, K, H] latent frequency tokens (noised)
+            x_t:  [N_a, K, Latent_dim] latent frequency tokens (noised)
             t:    [N_a] per-agent diffusion timestep
 
         Returns:
@@ -417,6 +406,7 @@ class QCNetFMDecoder(nn.Module):
             t = t.unsqueeze(0)
         t_emb = self.t_emb(continuous_inputs=t.unsqueeze(-1), categorical_embs=None)                          # [N_a, H]
         t_emb_s = t_emb.unsqueeze(1).expand(N_a, K, H)              # [N_a, K, H]
+        x = self.x_proj_in(x_t)
 
         # ---- Step 2: DiT blocks (K frequency tokens in parallel) ----
         x = x_t

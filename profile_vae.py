@@ -71,51 +71,62 @@ def main():
     with torch.no_grad():
         z_target = model.latent_encoder.encode(target) 
         
-        # 寻找真正需要预测的主车 (category == 3)
+        # 寻找需要预测的主车 (category == 3)
         eval_mask = data['agent']['category'] == 3
-        
-        # 核心拦截：寻找未来 60 步完全没有被 TargetBuilder 外推过的完美智能体！
         future_mask = data['agent']['predict_mask'][:, 50:] 
         fully_valid_mask = future_mask.all(dim=1)  
-        
         perfect_agents = torch.nonzero(eval_mask & fully_valid_mask).view(-1)
         
         if len(perfect_agents) > 0:
             displacements = torch.norm(target[perfect_agents, -1, :2] - target[perfect_agents, 0, :2], dim=-1)
             best_idx = torch.argmax(displacements).item()
             agent_idx = perfect_agents[best_idx].item()
-            print(f"\n🎯 成功锁定 100% 纯人类驾驶、无任何外推的完美主车 (Index: {agent_idx})")
+            print(f"\n🎯 成功锁定完美主车 (Index: {agent_idx})")
         else:
-            print("\n⚠️ 整个 Batch 中没有 100% 完整的类别 3 主车，退而求其次寻找真实点最多的主车...")
             valid_counts = future_mask[eval_mask].sum(dim=1)
             best_idx = torch.argmax(valid_counts).item()
             valid_indices = torch.nonzero(eval_mask).view(-1)
             agent_idx = valid_indices[best_idx].item()
-            print(f"👉 锁定了有效点最多的主车 (Index: {agent_idx})")
             
-        gt_traj = target[agent_idx].cpu().numpy() * 10.0  # 放大回物理尺度 (米)
+        gt_traj = target[agent_idx].cpu().numpy() * 10.0  # 主车 GT
         full_recon = model.latent_decoder(z_target)[agent_idx].cpu().numpy() * 10.0
         
+        # 🌟======= 👇 新增：精准锁定供体车辆 (Donor) 并提取其真实轨迹 =======🌟
+        valid_indices = torch.nonzero(eval_mask).view(-1)
+        if len(valid_indices) > 1:
+            # 挑选一个和主车索引不同的有效车辆作为供体
+            donor_idx = valid_indices[valid_indices != agent_idx][0].item() 
+            print(f"🧬 成功锁定供体车辆 (Index: {donor_idx})，准备提取其 Token 进行移花接木...")
+        else:
+            donor_idx = agent_idx
+            print("⚠️ 当前 Batch 中只有一个有效车辆，供体将退化为主车自身。")
+            
+        donor_traj = target[donor_idx].cpu().numpy() * 10.0  # 提取供体真实轨迹 (米)
+        # 🌟======= 👆 供体提取结束 =======🌟
+
         jerk_scores = []
         isolated_trajs = []
         
-        # 🌟 动态遍历 K 个 Token
+        # 🌟 动态遍历 K 个 Token 进行移花接木
         for i in range(K):
-            z_iso = torch.zeros_like(z_target)
-            z_iso[:, i, :] = z_target[:, i, :] 
-            traj_iso = model.latent_decoder(z_iso)  
+            z_mix = z_target.clone()
+            
+            # 🌟 移花接木核心：把主车的第 i 个 Token，替换成供体车辆的第 i 个 Token
+            z_mix[agent_idx, i, :] = z_target[donor_idx, i, :] 
+            
+            traj_iso = model.latent_decoder(z_mix)  
             
             # 计算 Jerk
             vel = traj_iso[:, 1:] - traj_iso[:, :-1]
             acc = vel[:, 1:] - vel[:, :-1]
             jerk = acc[:, 1:] - acc[:, :-1]
-            
             jerk_magnitude = jerk.norm(dim=-1).mean().item()
             jerk_scores.append(jerk_magnitude)
             
-            print(f"👉 Token {i} 的平均急动度 (Jerk): {jerk_magnitude:.6f}")
+            print(f"👉 替换 Token {i} 后主车的平均急动度 (Jerk): {jerk_magnitude:.6f}")
             isolated_trajs.append(traj_iso[agent_idx].cpu().numpy() * 10.0)
-
+            
+        # 💡 画图时，建议把 donor_idx 的真实轨迹也画在背景里作为参考！
     # ================= 画图模块 (动态自适应版) =================
     print(f"\n🎨 5. 正在生成 {K} 意图动态隔离子图...")
     
@@ -139,17 +150,23 @@ def main():
         ax = axs[i]
         color = base_colors[i % len(base_colors)]
         
-        # 1. 画出 GT 和 Full Recon 作为背景参考
-        ax.plot(gt_traj[:, 0], gt_traj[:, 1], 'k--', label='Ground Truth', linewidth=2)
-        ax.plot(full_recon[:, 0], full_recon[:, 1], 'gray', label='Full Recon', alpha=0.4, linewidth=6)
+        # 1. 画出主车的 GT 和 Full Recon 作为背景参考
+        ax.plot(gt_traj[:, 0], gt_traj[:, 1], 'k--', label='Main GT', linewidth=2)
+        ax.plot(full_recon[:, 0], full_recon[:, 1], 'gray', label='Main Full Recon', alpha=0.4, linewidth=6)
         
-        # 2. 画出当前的 Token
+        # 🌟======= 👇 新增：将供体车辆的真实轨迹也画出来 (用蓝色点虚线区别) =======🌟
+        if donor_idx != agent_idx:
+            ax.plot(donor_traj[:, 0], donor_traj[:, 1], 'b:', label='Donor GT', linewidth=2)
+            ax.scatter(donor_traj[0, 0], donor_traj[0, 1], color='blue', s=60, alpha=0.5, zorder=4)
+        # 🌟======= 👆 供体画图结束 =======🌟
+        
+        # 2. 画出移花接木后的混合轨迹
         traj = isolated_trajs[i]
-        ax.plot(traj[:, 0], traj[:, 1], color=color, label=f'Token {i}', linewidth=3)
+        ax.plot(traj[:, 0], traj[:, 1], color=color, label=f'Mixed Token {i}', linewidth=3)
         ax.scatter(traj[0, 0], traj[0, 1], color=color, s=100, edgecolors='white', zorder=5)
 
-        # 3. 动态配置标题和信息
-        ax.set_title(f"Isolated: Token {i}\n(Jerk: {jerk_scores[i]:.6f})", fontsize=16, pad=15)
+        # 3. 配置标题和信息
+        ax.set_title(f"Style Transfer: Token {i}\n(Jerk: {jerk_scores[i]:.6f})", fontsize=16, pad=15)
         ax.set_xlabel("X (meters)", fontsize=12)
         ax.set_ylabel("Y (meters)", fontsize=12)
         ax.grid(True, linestyle=':', alpha=0.6)

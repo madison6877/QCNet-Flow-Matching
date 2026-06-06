@@ -51,6 +51,7 @@ class QCNetFM(pl.LightningModule):
                  dataset: str,
                  input_dim: int,
                  hidden_dim: int,
+                 latent_dim: int,
                  output_dim: int,
                  num_historical_steps: int,
                  num_future_steps: int,
@@ -88,6 +89,7 @@ class QCNetFM(pl.LightningModule):
         self.dataset = dataset
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
         self.output_dim = output_dim
         self.num_historical_steps = num_historical_steps
         self.num_future_steps = num_future_steps
@@ -139,6 +141,7 @@ class QCNetFM(pl.LightningModule):
             dataset=dataset,
             input_dim=input_dim,
             hidden_dim=hidden_dim,
+            latent_dim=latent_dim,
             output_dim=output_dim,
             num_historical_steps=num_historical_steps,
             num_future_steps=num_future_steps,
@@ -161,6 +164,7 @@ class QCNetFM(pl.LightningModule):
 
         self.latent_encoder = LatentSpaceEncoder(
             hidden_dim=hidden_dim,
+            latent_dim=latent_dim,
             input_dim=output_dim,
             num_future_steps=num_future_steps,
             num_intents=vae_num_intents,
@@ -215,7 +219,7 @@ class QCNetFM(pl.LightningModule):
 
         agent_batch = data['agent'].get('batch', None)
         x_0, t = FlowMatchingLoss.sample_noise_and_time_latent(
-            self.vae_num_intents, target.size(0), self.hidden_dim, self.device, agent_batch)
+            self.vae_num_intents, target.size(0), self.latent_dim, self.device, agent_batch)
         # x_0: [N_a, 3, H], t: [N_a]
 
         # Linear interpolation in latent space: x_t = t * z_target + (1 - t) * x_0
@@ -247,9 +251,14 @@ class QCNetFM(pl.LightningModule):
             target = data['agent']['target'][..., :self.output_dim]
             target = target / 10.0
             predict_mask = data['agent']['predict_mask'][:, self.num_historical_steps:]
+            current_valid_mask = data['agent']['valid_mask'][:, self.num_historical_steps - 1]
+            predict_mask = predict_mask.clone()
+            predict_mask[~current_valid_mask] = False 
 
+        #print(f"Train_Target_Mean: {target.mean()}")  
         recon_x, mu, logvar = self.latent_encoder(target, predict_mask=predict_mask)
         loss, loss_dict = self.vae_loss(recon_x, mu, logvar, target, mask=predict_mask)
+         
 
         self.log('train_vae_loss', loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_vae_recon', loss_dict['loss_recon'], prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
@@ -290,6 +299,10 @@ class QCNetFM(pl.LightningModule):
             target = data['agent']['target'][..., :self.output_dim]
             target = target / 10.0
             predict_mask = data['agent']['predict_mask'][:, self.num_historical_steps:]
+            current_valid_mask = data['agent']['valid_mask'][:, self.num_historical_steps - 1]
+            predict_mask = predict_mask.clone()
+            predict_mask[~current_valid_mask] = False
+            #print(f"Val_Target_Mean: {target.mean()}")
 
             with torch.no_grad():
                 recon_x, mu, logvar = self.latent_encoder(target, predict_mask=predict_mask)
@@ -543,6 +556,7 @@ class QCNetFM(pl.LightningModule):
         parser.add_argument('--dataset', type=str, required=True)
         parser.add_argument('--input_dim', type=int, default=2)
         parser.add_argument('--hidden_dim', type=int, default=128)
+        parser.add_argument('--latent_dim', type=int, default=16)
         parser.add_argument('--output_dim', type=int, default=2)
         parser.add_argument('--num_historical_steps', type=int, required=True)
         parser.add_argument('--num_future_steps', type=int, required=True)
