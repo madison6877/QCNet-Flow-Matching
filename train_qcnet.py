@@ -22,13 +22,16 @@ from datamodules import ArgoverseV2DataModule
 from predictors import QCNet, QCNetFM
 
 import torch
+import torch.multiprocessing
+# 强制多进程使用文件系统共享，避免 /dev/shm 内存不足导致的文件句柄丢失
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 # 添加这一行来启用 Tensor Cores 优化
 # 'high' 是最推荐的设置：速度快，精度损失几乎可以忽略不计
 torch.set_float32_matmul_precision('high')
 
 if __name__ == '__main__':
-    pl.seed_everything(2027, workers=True)
+    pl.seed_everything(2025, workers=True)
 
     parser = ArgumentParser()
     parser.add_argument('--root', type=str, required=True)

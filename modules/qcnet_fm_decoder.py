@@ -203,24 +203,25 @@ class AsymmetricVelocityHead(nn.Module):
     def __init__(self, hidden_dim: int, output_dim: int, num_intents: int = 3) -> None:
         super(AsymmetricVelocityHead, self).__init__()
         self.num_intents = num_intents
+        self.shortcut = nn.Linear(hidden_dim, output_dim)
+        self.residual = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, output_dim)
+        )
+        self._init_weights()
 
-        def _make_head():
-            return nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim * 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim * 2, output_dim),
-            )
-        
-        heads = [_make_head()]
-        for _ in range(num_intents - 1):
-            heads.append(_make_head())
-        self.heads = nn.ModuleList(heads)
+    def _init_weights(self):
+        nn.init.zeros_(self.residual[-1].weight)
+        nn.init.zeros_(self.residual[-1].bias)
+        nn.init.zeros_(self.shortcut.weight)
+        nn.init.zeros_(self.shortcut.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [N_a, K, H] -> velocity: [N_a, K, H]"""
-        outputs = [self.heads[i](x[:, i]) for i in range(self.num_intents)]
-        return torch.stack(outputs, dim=1)
-
+        base_vel = self.shortcut(x) 
+        res_vel = self.residual(x)
+        return base_vel + res_vel
 
 class QCNetFMDecoder(nn.Module):
     def __init__(self,
@@ -398,18 +399,29 @@ class QCNetFMDecoder(nn.Module):
         Returns:
             v_theta: [N_a, K, H] predicted velocity for each frequency band
         """
-        N_a, K, H = x_t.shape
+        # 🌟 修复 1：提取 latent_dim，但明确声明 H 为 hidden_dim
+        N_a, K, latent_dim = x_t.shape
+        H = self.hidden_dim
         device = x_t.device
 
         # ---- Step 1: Time embedding (per-agent, shared across K tokens) ----
         if t.dim() == 0:
             t = t.unsqueeze(0)
-        t_emb = self.t_emb(continuous_inputs=t.unsqueeze(-1), categorical_embs=None)                          # [N_a, H]
-        t_emb_s = t_emb.unsqueeze(1).expand(N_a, K, H)              # [N_a, K, H]
-        x = self.x_proj_in(x_t)
+        
+        # t_emb 产生的是 [N_a, hidden_dim] 的特征
+        t_emb = self.t_emb(continuous_inputs=t.unsqueeze(-1), categorical_embs=None)
+        
+        # 扩展到 [N_a, K, hidden_dim]
+        t_emb_s = t_emb.unsqueeze(1).expand(N_a, K, H)         
+
+        x_t_hist_unflat = ctx['x_t_hist'].view(N_a, self.num_historical_steps, H)
+        x_m = x_t_hist_unflat[:, -1, :]  # [N_a, H]
+        
+        # 将输入噪声投影，并加上智能体的当前特征作为强大的 Condition
+        x = self.x_proj_in(x_t) + x_m.unsqueeze(1)     
 
         # ---- Step 2: DiT blocks (K frequency tokens in parallel) ----
-        x = x_t
+        # 🌟 修复 2：删除了原来在这里的致命错误 `x = x_t`
         for block in self.blocks:
             x = block(
                 x=x, t_emb_s=t_emb_s,
@@ -422,7 +434,7 @@ class QCNetFMDecoder(nn.Module):
             )
 
         # ---- Step 3: Asymmetric velocity output (K separate heads) ----
-        v_theta = self.to_vel(x)  # [N_a, K, H]
+        v_theta = self.to_vel(x)  # [N_a, K, output_dim/latent_dim]
 
         return v_theta
 
@@ -469,7 +481,7 @@ class QCNetFMDecoder(nn.Module):
 
         for _ in range(num_modes):
             # initial noise in latent space: x_0 ~ N(0, I)  → [N_a, K, H]
-            x_t = torch.randn(N_a, self.num_intents, self.hidden_dim, device=device)
+            x_t = torch.randn(N_a, self.num_intents, self.latent_dim, device=device)
             for t_val in t_grid:
                 t_cur_tensor.fill_(t_val)
                 t_next_tensor.fill_(t_val + dt)

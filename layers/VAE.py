@@ -352,7 +352,7 @@ class VAE(nn.Module):
         # 3. Reparameterization (shared MLP, after all encoder blocks)
         params = self.reparam_mlp(intents)  # [3, N_a, hidden_dim * 2]
         mu, logvar = torch.chunk(params, 2, dim=-1)  # each [3, N_a, hidden_dim]
-        logvar = torch.clamp(logvar, min=-4.0)
+        logvar = torch.clamp(logvar, min=-10.0, max=5.0)
 
         # Sample z via reparameterization trick
         if self.training:
@@ -374,13 +374,13 @@ class VAE(nn.Module):
         """
         N_a = z.size(1)
         # 🌟 强行打破垄断：训练阶段，随机“遮蔽”或“打乱” Token
-        if self.training:
-            # 策略：30% 的概率随机扔掉部分 Token，强迫解码器寻找其他信息来源
-            # 这是一个简单的 Dropout 变种，但作用在潜空间 Token 上
-            if torch.rand(1) < 0.2:
-                # 随机选择一个 Token 索引进行屏蔽
-                drop_idx = torch.randint(0, self.num_intents, (1,)).item()
-                z[drop_idx, :, :] = 0
+        # if self.training:
+        #     # 策略：30% 的概率随机扔掉部分 Token，强迫解码器寻找其他信息来源
+        #     # 这是一个简单的 Dropout 变种，但作用在潜空间 Token 上
+        #     if torch.rand(1) < 0.2:
+        #         # 随机选择一个 Token 索引进行屏蔽
+        #         drop_idx = torch.randint(0, self.num_intents, (1,)).item()
+        #         z[drop_idx, :, :] = 0
         z = self.z_proj(z)  # [3, N_a, hidden_dim] → projected to hidden_dim for cross-attention
 
         # Expand learnable time queries (shared across all decoder blocks)
