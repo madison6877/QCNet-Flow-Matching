@@ -72,7 +72,8 @@ class AttentionLayer(MessagePassing):
     def forward(self,
                 x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                 r: Optional[torch.Tensor],
-                edge_index: torch.Tensor) -> torch.Tensor:
+                edge_index: torch.Tensor,
+                edge_gate: Optional[torch.Tensor] = None) -> torch.Tensor:
         if isinstance(x, torch.Tensor):
             x_src = x_dst = self.attn_prenorm_x_src(x)
         else:
@@ -82,7 +83,7 @@ class AttentionLayer(MessagePassing):
             x = x[1]
         if self.has_pos_emb and r is not None:
             r = self.attn_prenorm_r(r)
-        x = x + self.attn_postnorm(self._attn_block(x_src, x_dst, r, edge_index))
+        x = x + self.attn_postnorm(self._attn_block(x_src, x_dst, r, edge_index, edge_gate))
         x = x + self.ff_postnorm(self._ff_block(self.ff_prenorm(x)))
 
         # # === 修改开始 ===
@@ -104,11 +105,15 @@ class AttentionLayer(MessagePassing):
                 v_j: torch.Tensor,
                 r: Optional[torch.Tensor],
                 index: torch.Tensor,
-                ptr: Optional[torch.Tensor]) -> torch.Tensor:
+                ptr: Optional[torch.Tensor],
+                edge_gate: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.has_pos_emb and r is not None:
             k_j = k_j + self.to_k_r(r).view(-1, self.num_heads, self.head_dim)
             v_j = v_j + self.to_v_r(r).view(-1, self.num_heads, self.head_dim)
         sim = (q_i * k_j).sum(dim=-1) * self.scale
+        if edge_gate is not None:
+            bias = torch.log(edge_gate + 1e-6) # [E]
+            sim = sim + bias.unsqueeze(-1)
         attn = softmax(sim, index, ptr)
         attn = self.attn_drop(attn)
         return v_j * attn.unsqueeze(-1)
@@ -124,11 +129,12 @@ class AttentionLayer(MessagePassing):
                     x_src: torch.Tensor,
                     x_dst: torch.Tensor,
                     r: Optional[torch.Tensor],
-                    edge_index: torch.Tensor) -> torch.Tensor:
+                    edge_index: torch.Tensor,
+                    edge_gate: Optional[torch.Tensor] = None) -> torch.Tensor:
         q = self.to_q(x_dst).view(-1, self.num_heads, self.head_dim)
         k = self.to_k(x_src).view(-1, self.num_heads, self.head_dim)
         v = self.to_v(x_src).view(-1, self.num_heads, self.head_dim)
-        agg = self.propagate(edge_index=edge_index, x_dst=x_dst, q=q, k=k, v=v, r=r)
+        agg = self.propagate(edge_index=edge_index, x_dst=x_dst, q=q, k=k, v=v, r=r, edge_gate=edge_gate)
         return self.to_out(agg)
 
     def _ff_block(self, x: torch.Tensor) -> torch.Tensor:

@@ -127,6 +127,7 @@ class QCNetDiTBlock(nn.Module):
                 edge_index_pl2a_exp: torch.Tensor,
                 r_a2a_exp: torch.Tensor,
                 edge_index_a2a_exp: torch.Tensor,
+                edge_threat_exp: torch.Tensor,
                 K: int) -> torch.Tensor:
         N_a = x.size(0)
 
@@ -168,7 +169,7 @@ class QCNetDiTBlock(nn.Module):
         shift3_a, scale3_a = ss3_attn.chunk(2, dim=-1)
         x_mod = self.norm3(x_flat) * (1.0 + scale3_a) + shift3_a
         r_norm = self.a2a_attn.attn_prenorm_r(r_a2a_exp) if (self.a2a_attn.has_pos_emb and r_a2a_exp is not None) else None
-        attn_out = self.a2a_attn._attn_block(x_src=x_mod, x_dst=x_mod, r=r_norm, edge_index=edge_index_a2a_exp)
+        attn_out = self.a2a_attn._attn_block(x_src=x_mod, x_dst=x_mod, r=r_norm, edge_index=edge_index_a2a_exp, edge_gate=edge_threat_exp)
         x_flat = x_flat + attn_out
         shift3_f, scale3_f = ss3_ffn.chunk(2, dim=-1)
         ff_in = self.a2a_attn.ff_prenorm(x_flat) * (1.0 + scale3_f) + shift3_f  
@@ -270,12 +271,31 @@ class QCNetFMDecoder(nn.Module):
 
         self.t_emb = FourierEmbedding(input_dim=1, hidden_dim=hidden_dim, num_freq_bands=num_freq_bands)
 
-        self.r_t2a_emb = FourierEmbedding(input_dim=input_dim_r_t, hidden_dim=hidden_dim,
-                                          num_freq_bands=num_freq_bands)
-        self.r_pl2a_emb = FourierEmbedding(input_dim=input_dim_r_pl2a, hidden_dim=hidden_dim,
-                                           num_freq_bands=num_freq_bands)
-        self.r_a2a_emb = FourierEmbedding(input_dim=input_dim_r_a2a, hidden_dim=hidden_dim,
-                                           num_freq_bands=num_freq_bands)
+        self.r_t2a_emb = FourierEmbedding(input_dim=input_dim_r_t, hidden_dim=hidden_dim, num_freq_bands=num_freq_bands)
+
+        self.r_pl2a_emb = FourierEmbedding(input_dim=input_dim_r_pl2a, hidden_dim=hidden_dim, num_freq_bands=num_freq_bands)
+
+        self.r_a2a_emb = FourierEmbedding(input_dim=input_dim_r_a2a, hidden_dim=hidden_dim, num_freq_bands=num_freq_bands)
+
+        self.threat_fourier = FourierEmbedding(input_dim=5, hidden_dim=hidden_dim,  num_freq_bands=num_freq_bands)
+        
+        self.map_fourier = FourierEmbedding(input_dim=3, hidden_dim=hidden_dim, num_freq_bands=num_freq_bands)
+
+        self.threat_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()
+        )
+        
+        self.map_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.LayerNorm(hidden_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid()
+        )
 
         self.blocks = nn.ModuleList(
             [QCNetDiTBlock(hidden_dim=hidden_dim, num_heads=num_heads, head_dim=head_dim, dropout=dropout)
@@ -332,13 +352,76 @@ class QCNetFMDecoder(nn.Module):
             batch_y=data['map_polygon']['batch'] if isinstance(data, Batch) else None,
             max_num_neighbors=300)
         edge_index_pl2a = edge_index_pl2a[:, mask_dst[edge_index_pl2a[1], 0]]
-        rel_pos_pl2a = pos_pl[edge_index_pl2a[0]] - pos_m[edge_index_pl2a[1]]
-        rel_orient_pl2a = wrap_angle(orient_pl[edge_index_pl2a[0]] - head_m[edge_index_pl2a[1]])
+        src_pl, dst_a = edge_index_pl2a[0], edge_index_pl2a[1]
+        rel_pos_pl2a = pos_pl[src_pl] - pos_m[dst_a]
+        rel_orient_pl2a = wrap_angle(orient_pl[src_pl] - head_m[dst_a])
         r_pl2a = torch.stack(
             [torch.norm(rel_pos_pl2a[:, :2], p=2, dim=-1),
-             angle_between_2d_vectors(ctr_vector=head_vector_m[edge_index_pl2a[1]], nbr_vector=rel_pos_pl2a[:, :2]),
+             angle_between_2d_vectors(ctr_vector=head_vector_m[dst_a], nbr_vector=rel_pos_pl2a[:, :2]),
              rel_orient_pl2a], dim=-1)
-        r_pl2a = self.r_pl2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
+        r_pl2a_emb_feat = self.r_pl2a_emb(continuous_inputs=r_pl2a, categorical_embs=None)
+        if rel_pos_pl2a.size(0) > 0:
+            # ----------------------------------------------------
+            # 🌟 地图门控双路融合 (Map Dual-Stream Gating)
+            # ----------------------------------------------------
+            # 路一：物理极坐标 (距离 + 夹角)
+            dist_pl2a = torch.norm(rel_pos_pl2a, p=2, dim=-1, keepdim=True)
+            azimuth_pl2a = wrap_angle(torch.atan2(rel_pos_pl2a[:, 1], rel_pos_pl2a[:, 0]) - head_m[dst_a]).unsqueeze(-1)
+            
+            map_phys_raw = torch.cat([dist_pl2a, azimuth_pl2a, rel_orient_pl2a.unsqueeze(-1)], dim=-1)
+            # 使用一个新的 map_fourier 网络将 3维物理量 升维
+            map_phys_emb = self.map_fourier(continuous_inputs=map_phys_raw, categorical_embs=None)
+
+            # 路二：深层意图对齐
+            # x_pl [N_pl, hidden_dim] 是地图特征
+            x_src_pl = scene_enc['x_pl'][:, self.num_historical_steps - 1][src_pl] 
+            x_dst_a = scene_enc['x_a'][:, -1, :][dst_a]
+            
+            # 使用相对编码 r_pl2a_emb_feat 对齐坐标系
+            aligned_x_src_pl = x_src_pl + r_pl2a_emb_feat
+            map_deep_feat = aligned_x_src_pl - x_dst_a
+            
+            # 融合并打分 (分数越高代表该地图元素越重要)
+            map_combined_feat = map_phys_emb + map_deep_feat
+            map_importance_scores = self.map_net(map_combined_feat).squeeze(-1) 
+            
+            # 【可选】硬截断：只保留对主车最重要的 Top-K_map 个地图元素
+            K_map = 32  # 地图元素通常比车辆多，保留 32 个足够了
+            sort_key_map = dst_a.double() * 100.0 - map_importance_scores.double()
+            sorted_indices_map = torch.argsort(sort_key_map)
+            sorted_dst_map = dst_a[sorted_indices_map]
+            
+            _, counts_map = torch.unique_consecutive(sorted_dst_map, return_counts=True)
+            local_ranks_map = torch.cat([torch.arange(c, device=pos_m.device) for c in counts_map])
+            
+            keep_mask_map = local_ranks_map < K_map
+            keep_indices_map = sorted_indices_map[keep_mask_map]
+            
+            edge_index_pl2a = edge_index_pl2a[:, keep_indices_map]
+            r_pl2a = r_pl2a_emb_feat[keep_indices_map]
+            edge_map_scores = map_importance_scores[keep_indices_map]
+            
+            # 软门控稀释原始相对编码
+            r_pl2a = r_pl2a * edge_map_scores.unsqueeze(-1)
+        else:
+            r_pl2a = r_pl2a_emb_feat
+            edge_map_scores = torch.empty(0, device=pos_m.device)
+        # ==========================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
         # agent -> agent (a2a)
         edge_index_a2a = radius_graph(
@@ -354,7 +437,65 @@ class QCNetFMDecoder(nn.Module):
             [torch.norm(rel_pos_a2a[:, :2], p=2, dim=-1),
              angle_between_2d_vectors(ctr_vector=head_vector_m[edge_index_a2a[1]], nbr_vector=rel_pos_a2a[:, :2]),
              rel_head_a2a], dim=-1)
-        r_a2a = self.r_a2a_emb(continuous_inputs=r_a2a, categorical_embs=None)
+        r_a2a_emb_feat = self.r_a2a_emb(continuous_inputs=r_a2a, categorical_embs=None)
+
+       # ==========================================================
+        # 🌟 插件模块：极坐标 PINN 威胁网络 + 节点级门控计算
+        # ==========================================================
+        src_a, dst_a = edge_index_a2a[0], edge_index_a2a[1]
+        
+        # 提取速度特征
+        vel_m = data['agent']['velocity'][:, self.num_historical_steps - 1, :2]
+        rel_vel_a2a = vel_m[src_a] - vel_m[dst_a]
+        rel_pos_a2a = pos_m[src_a] - pos_m[dst_a]
+        rel_head_a2a = wrap_angle(head_m[src_a] - head_m[dst_a])
+
+        if rel_pos_a2a.size(0) > 0:
+
+            # 1. 位置转化为：距离 (Distance) 和 相对主车车头的方位角 (Azimuth)
+            dist_a2a = torch.norm(rel_pos_a2a, p=2, dim=-1, keepdim=True)
+            azimuth_a2a = wrap_angle(torch.atan2(rel_pos_a2a[:, 1], rel_pos_a2a[:, 0]) - head_m[dst_a]).unsqueeze(-1)
+            
+            # 2. 速度转化为：相对速率 (Speed) 和 速度向量方位角 (Velocity Angle)
+            speed_a2a = torch.norm(rel_vel_a2a, p=2, dim=-1, keepdim=True)
+            vel_angle_a2a = wrap_angle(torch.atan2(rel_vel_a2a[:, 1], rel_vel_a2a[:, 0]) - head_m[dst_a]).unsqueeze(-1)
+            
+            # 组装 5 维极坐标特征！(维度依然是 5，无需修改初始化网络)
+            phys_feat_raw = torch.cat([dist_a2a, azimuth_a2a, speed_a2a, vel_angle_a2a, rel_head_a2a.unsqueeze(-1)], dim=-1)
+            phys_emb = self.threat_fourier(continuous_inputs=phys_feat_raw, categorical_embs=None) # [E, hidden_dim]
+            x_src_a = scene_enc['x_a'][:, -1, :][src_a]  # 处于 src 的局部坐标系
+            x_dst_a = scene_enc['x_a'][:, -1, :][dst_a]  # 处于 dst 的局部坐标系
+            aligned_x_src = x_src_a + r_a2a_emb_feat
+            deep_feat = aligned_x_src - x_dst_a
+            combined_feat = phys_emb + deep_feat
+            threat_scores = self.threat_net(combined_feat).squeeze(-1)  # [E]
+            
+            # 物理公式运算 (用于计算 Loss，不受极坐标影响，依然用向量点积最快)
+            with torch.no_grad():
+                dist_val = dist_a2a.squeeze(-1)
+                approach_speed = - (rel_vel_a2a * rel_pos_a2a).sum(dim=-1) / (dist_val + 1e-5)
+                ttc = dist_val / (F.relu(approach_speed) + 1e-5)
+                physics_danger = (ttc < 3.5) & (dist_val < 20.0)
+            
+            # 计算 PINN 损失
+            miss_penalty = physics_danger.float() * (1.0 - threat_scores).pow(2)
+            sparsity_penalty = (~physics_danger).float() * threat_scores.abs()
+            pinn_loss = miss_penalty.mean() + 0.1 * sparsity_penalty.mean()
+            
+            K_neighbors = 24
+            sort_key = dst_a.double() * 100.0 - threat_scores.double()
+            sorted_indices = torch.argsort(sort_key)
+            sorted_dst = dst_a[sorted_indices]
+            _, counts = torch.unique_consecutive(sorted_dst, return_counts=True)
+            local_ranks = torch.cat([torch.arange(c, device=pos_m.device) for c in counts])
+            keep_mask = local_ranks < K_neighbors
+            keep_indices = sorted_indices[keep_mask]
+            
+            edge_index_a2a = edge_index_a2a[:, keep_indices]
+            r_a2a = r_a2a_emb_feat[keep_indices]
+
+            edge_threat_scores = threat_scores[keep_indices]
+        # ==========================================================
 
         # prepare context features for attention
         x_t_hist = scene_enc['x_a'].reshape(-1, self.hidden_dim)
@@ -370,6 +511,9 @@ class QCNetFMDecoder(nn.Module):
         r_pl2a_exp = r_pl2a.unsqueeze(0).expand(K, -1, -1).reshape(-1, r_pl2a.size(-1)) if r_pl2a is not None else None
         r_a2a_exp = r_a2a.unsqueeze(0).expand(K, -1, -1).reshape(-1, r_a2a.size(-1)) if r_a2a is not None else None
 
+        edge_threat_exp = edge_threat_scores.unsqueeze(0).expand(K, -1).reshape(-1) if 'edge_threat_scores' in locals() else None
+        edge_map_exp = edge_map_scores.unsqueeze(0).expand(K, -1).reshape(-1) if 'edge_map_scores' in locals() else None
+
         return {
             'pos_m': pos_m,
             'head_m': head_m,
@@ -383,6 +527,9 @@ class QCNetFMDecoder(nn.Module):
             'x_t_hist': x_t_hist,
             'x_pl': x_pl,
             'agent_batch': agent_batch,
+            'edge_threat_exp': edge_threat_exp,
+            'edge_map_exp': edge_map_exp,
+            'pinn_loss': pinn_loss
         }
 
     def _forward_core(self,
@@ -431,6 +578,7 @@ class QCNetFMDecoder(nn.Module):
                 x_pl=ctx['x_pl'],
                 r_pl2a_exp=ctx['r_pl2a_exp'], edge_index_pl2a_exp=ctx['edge_index_pl2a_exp'],
                 r_a2a_exp=ctx['r_a2a_exp'], edge_index_a2a_exp=ctx['edge_index_a2a_exp'],
+                edge_threat_exp =ctx['edge_threat_exp']
             )
 
         # ---- Step 3: Asymmetric velocity output (K separate heads) ----
@@ -444,7 +592,9 @@ class QCNetFMDecoder(nn.Module):
                 x_t: torch.Tensor,
                 t: torch.Tensor) -> torch.Tensor:
         ctx = self._build_graph_context(data, scene_enc)
-        return self._forward_core(ctx, x_t, t)
+        v_theta = self._forward_core(ctx, x_t, t)
+        pinn_loss = ctx.get('pinn_loss', torch.tensor(0.0, device=x_t.device))
+        return v_theta, pinn_loss
 
     @torch.no_grad()
     def sample(self,

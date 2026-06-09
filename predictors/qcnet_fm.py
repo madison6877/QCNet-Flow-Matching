@@ -227,7 +227,7 @@ class QCNetFM(pl.LightningModule):
         x_t = (1 - t_exp) * x_0 + t_exp * z_target
 
         scene_enc = self.encoder(data)
-        v_theta = self(data, scene_enc, x_t, t)  # [N_a, 3, H]
+        v_theta, pinn_loss = self(data, scene_enc, x_t, t)  # [N_a, 3, H]
 
         # 🌟 修复 1：过滤掉 99% 不需要预测的背景车辆的垃圾梯度
         valid_mask = predict_mask.any(dim=-1)
@@ -240,8 +240,10 @@ class QCNetFM(pl.LightningModule):
 
         # 只对有效的车辆计算 Flow Matching Loss
         loss, loss_dict = self.latent_fm_loss(v_theta_valid, z_target_valid, x_0_valid)
+        loss = loss + pinn_loss
         
         self.log('train_fm_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
+        self.log('train_pinn_loss', pinn_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
         for k_name, v_loss in loss_dict.items():
             self.log(f'train_{k_name}', v_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
         
@@ -342,7 +344,7 @@ class QCNetFM(pl.LightningModule):
                 self.vae_num_intents, target.size(0), self.latent_dim, self.device, agent_batch)
             t_exp = t[:, None, None]
             x_t = (1 - t_exp) * x_0 + t_exp * z_target
-            v_theta = self(data, scene_enc, x_t, t)
+            v_theta, pinn_loss = self(data, scene_enc, x_t, t)
 
         # 🌟 修复 1：过滤掉 99% 不需要预测的背景车辆的垃圾梯度
         valid_mask = predict_mask.any(dim=-1)
@@ -355,8 +357,10 @@ class QCNetFM(pl.LightningModule):
 
         # 只对有效的车辆计算 Flow Matching Loss
         loss, loss_dict = self.latent_fm_loss(v_theta_valid, z_target_valid, x_0_valid)
+        loss = loss + pinn_loss
         
         self.log('val_fm_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
+        self.log('val_pinn_loss', pinn_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
         for k_name, v_loss in loss_dict.items():
             self.log(f'val_{k_name}', v_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
 
