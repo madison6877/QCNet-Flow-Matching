@@ -128,6 +128,7 @@ class QCNetDiTBlock(nn.Module):
                 r_a2a_exp: torch.Tensor,
                 edge_index_a2a_exp: torch.Tensor,
                 edge_threat_exp: torch.Tensor,
+                edge_map_exp: torch.Tensor,
                 K: int) -> torch.Tensor:
         N_a = x.size(0)
 
@@ -135,7 +136,10 @@ class QCNetDiTBlock(nn.Module):
         t_emb_flat = t_emb_s.reshape(N_a * K, self.hidden_dim)      
 
         freq_emb_flat = freq_pos_emb.unsqueeze(0).expand(N_a, K, self.hidden_dim).reshape(N_a * K, self.hidden_dim)
-        cond = t_emb_flat + freq_emb_flat
+        if K > 1:
+            cond = t_emb_flat + freq_emb_flat
+        else:
+            cond = t_emb_flat
 
         shift_scale_all = self.adaLN_all(cond)
         
@@ -158,7 +162,7 @@ class QCNetDiTBlock(nn.Module):
         x_mod = self.norm2(x_flat) * (1.0 + scale2_a) + shift2_a
         x_src_norm = self.pl2a_attn.attn_prenorm_x_src(x_pl)
         r_norm = self.pl2a_attn.attn_prenorm_r(r_pl2a_exp) if (self.pl2a_attn.has_pos_emb and r_pl2a_exp is not None) else None
-        attn_out = self.pl2a_attn._attn_block(x_src=x_src_norm, x_dst=x_mod, r=r_norm, edge_index=edge_index_pl2a_exp)
+        attn_out = self.pl2a_attn._attn_block(x_src=x_src_norm, x_dst=x_mod, r=r_norm, edge_index=edge_index_pl2a_exp, edge_gate=edge_map_exp)
         x_flat = x_flat + attn_out
         shift2_f, scale2_f = ss2_ffn.chunk(2, dim=-1)
         ff_in = self.pl2a_attn.ff_prenorm(x_flat) * (1.0 + scale2_f) + shift2_f
@@ -408,21 +412,6 @@ class QCNetFMDecoder(nn.Module):
             edge_map_scores = torch.empty(0, device=pos_m.device)
         # ==========================================================
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
         # agent -> agent (a2a)
         edge_index_a2a = radius_graph(
             x=pos_m[:, :2],
@@ -578,7 +567,8 @@ class QCNetFMDecoder(nn.Module):
                 x_pl=ctx['x_pl'],
                 r_pl2a_exp=ctx['r_pl2a_exp'], edge_index_pl2a_exp=ctx['edge_index_pl2a_exp'],
                 r_a2a_exp=ctx['r_a2a_exp'], edge_index_a2a_exp=ctx['edge_index_a2a_exp'],
-                edge_threat_exp =ctx['edge_threat_exp']
+                edge_threat_exp =ctx['edge_threat_exp'],
+                edge_map_exp =ctx['edge_map_exp']
             )
 
         # ---- Step 3: Asymmetric velocity output (K separate heads) ----
