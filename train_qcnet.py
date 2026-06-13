@@ -31,7 +31,7 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 torch.set_float32_matmul_precision('high')
 
 if __name__ == '__main__':
-    pl.seed_everything(2025, workers=True)
+    pl.seed_everything(2026, workers=True)
 
     parser = ArgumentParser()
     parser.add_argument('--root', type=str, required=True)
@@ -73,8 +73,26 @@ if __name__ == '__main__':
         else:
             # 【跨阶段全新启动】：只加载模型权重，剥离所有优化器状态，从 Epoch 0 重新开始
             print(f"🚀 [New Stage] 正在从 {args.ckpt_path} 仅加载预训练权重 (作为全新阶段的起点)...")
-            model = model_cls.load_from_checkpoint(args.ckpt_path, strict=False, **vars(args))
+            checkpoint = torch.load(args.ckpt_path, map_location='cpu')
+            state_dict = checkpoint.get('state_dict', checkpoint)
+            corrupted_keys = [
+                'fm_decoder.to_vel.residual',
+                'fm_decoder.to_vel.time_proj',
+                'fm_decoder.to_vel.norm',
+                'fm_decoder.to_vel.shortcut'
+            ]
+            clean_state_dict = {}
+            for k, v in state_dict.items():
+                if any(ck in k for ck in corrupted_keys):
+                    print(f"🚯 已主动从 Checkpoint 中抹除冲突的老输出头权重: {k}")
+                    continue  # 优雅拦截老噪声，不让它进入加载流
+                clean_state_dict[k] = v
+                
+            # 3. 用提纯后的绝对干净的字典喂给模型，开启 strict=False 护航
+            model.load_state_dict(clean_state_dict, strict=False)
             fit_ckpt_path = None
+            # model = model_cls.load_from_checkpoint(args.ckpt_path, strict=False, **vars(args))
+            # fit_ckpt_path = None
 
     if args.model_type == 'qcnet_fm' and args.vae_only:
         monitor_metric = 'val_vae_loss'

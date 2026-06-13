@@ -181,6 +181,23 @@ class QCNetFM(pl.LightningModule):
 
         self.test_predictions = dict()
 
+        means = [-0.0294,  0.0605, -0.0145, -0.0150, -0.0907]
+        stds  = [ 1.0592,  0.8184,  0.6869,  0.4002,  0.6022]
+        self.register_buffer('z_mean', torch.tensor(means, dtype=torch.float32).view(1, 1, -1))
+        self.register_buffer('z_std', torch.tensor(stds, dtype=torch.float32).view(1, 1, -1))
+
+        # 包裹 VAE Decoder 自动反归一化
+        class UnnormDecoderWrapper(nn.Module):
+            def __init__(self, decoder, mean, std):
+                super().__init__()
+                self.decoder = decoder
+                self.mean = mean
+                self.std = std
+            def forward(self, z, *args, **kwargs):
+                z_unnorm = z * self.std.to(z.device) + self.mean.to(z.device)
+                return self.decoder(z_unnorm, *args, **kwargs)
+        self.latent_decoder = UnnormDecoderWrapper(self.latent_decoder, self.z_mean, self.z_std)
+
     def forward(self, data: HeteroData, scene_enc: dict, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         v_theta = self.fm_decoder(data, scene_enc, x_t, t)
         return v_theta
@@ -217,6 +234,10 @@ class QCNetFM(pl.LightningModule):
         with torch.no_grad():
             z_target = self.latent_encoder.encode(target, predict_mask=predict_mask)  # [N_a, 3, H]
 
+        #-----------------------------------------------------------------------
+        z_target = (z_target - self.z_mean) / (self.z_std + 1e-6)
+        #-----------------------------------------------------------------------
+
         agent_batch = data['agent'].get('batch', None)
         x_0, t = FlowMatchingLoss.sample_noise_and_time_latent(
             self.vae_num_intents, target.size(0), self.latent_dim, self.device, agent_batch)
@@ -240,12 +261,12 @@ class QCNetFM(pl.LightningModule):
 
         # 只对有效的车辆计算 Flow Matching Loss
         loss, loss_dict = self.latent_fm_loss(v_theta_valid, z_target_valid, x_0_valid)
-        loss = loss + pinn_loss
+        loss = loss + 1000.0 * pinn_loss
         
         self.log('train_fm_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
         self.log('train_pinn_loss', pinn_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
-        for k_name, v_loss in loss_dict.items():
-            self.log(f'train_{k_name}', v_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
+        # for k_name, v_loss in loss_dict.items():
+        #     self.log(f'train_{k_name}', v_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
         
         return loss
 
@@ -339,6 +360,9 @@ class QCNetFM(pl.LightningModule):
 
             # Encode target to latent for validation loss computation
             z_target = self.latent_encoder.encode(target, predict_mask=predict_mask)  # [N_a, 3, H]
+            #-----------------------------------------------------------------------
+            z_target = (z_target - self.z_mean) / (self.z_std + 1e-6)
+            #-----------------------------------------------------------------------
 
             x_0, t = FlowMatchingLoss.sample_noise_and_time_latent(
                 self.vae_num_intents, target.size(0), self.latent_dim, self.device, agent_batch)
@@ -357,12 +381,12 @@ class QCNetFM(pl.LightningModule):
 
         # 只对有效的车辆计算 Flow Matching Loss
         loss, loss_dict = self.latent_fm_loss(v_theta_valid, z_target_valid, x_0_valid)
-        loss = loss + pinn_loss
+        loss = loss + 1000.0 * pinn_loss
         
         self.log('val_fm_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
         self.log('val_pinn_loss', pinn_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
-        for k_name, v_loss in loss_dict.items():
-            self.log(f'val_{k_name}', v_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
+        # for k_name, v_loss in loss_dict.items():
+        #     self.log(f'val_{k_name}', v_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
 
         # Stage 1: stop here, only evaluate FM velocity field loss
         if not self.scorer_only :
@@ -545,7 +569,7 @@ class QCNetFM(pl.LightningModule):
         elif getattr(self, 'scorer_only', False):
             warmup_epochs = 1  # Stage 2 (Scorer): 只训练打分器，1 个 Epoch 足够
         else:
-            warmup_epochs = 3  # Stage 1 (FM): 核心潜空间流匹配，必须给足 4 个 Epoch 防爆
+            warmup_epochs = 3  # Stage 1 (FM): 核心潜空间流匹配，必须给足 3 个 Epoch 防爆
 
         # 2. 安全构建调度器 (加入 VAE 与 FM 的调度分流)
         if warmup_epochs > 0:
@@ -557,7 +581,7 @@ class QCNetFM(pl.LightningModule):
             cosine_scheduler = CosineAnnealingLR(
                 optimizer, 
                 T_max=self.T_max - warmup_epochs, 
-                eta_min=0.0
+                eta_min=1e-6
             )
             scheduler = SequentialLR(
                 optimizer, 

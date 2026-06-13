@@ -118,11 +118,12 @@ class VAEEncoderBlock(nn.Module):
         )
 
         # 2. Intent self-attention
-        intents = self._self_attn_block(
-            intents,
-            self.intent_sa_norm1, self.intent_sa,
-            self.intent_sa_norm2, self.intent_sa_ffn,
-        )
+        if self.num_intents > 1:
+            intents = self._self_attn_block(
+                intents,
+                self.intent_sa_norm1, self.intent_sa,
+                self.intent_sa_norm2, self.intent_sa_ffn,
+            )
 
         # 3. Intent×trajectory cross-attention
         intents = self._cross_attn_block(
