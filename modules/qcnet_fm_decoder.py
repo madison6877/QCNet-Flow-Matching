@@ -85,10 +85,6 @@ class QCNetDiTBlock(nn.Module):
         self.adaLN_a2a = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
         self.adaLN_seg = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
 
-        for ada_layer in [self.adaLN_t2a, self.adaLN_pl2a, self.adaLN_a2a, self.adaLN_seg]:
-            nn.init.zeros_(ada_layer[-1].weight)
-            nn.init.zeros_(ada_layer[-1].bias)
-
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.norm3 = nn.LayerNorm(hidden_dim)
@@ -105,6 +101,11 @@ class QCNetDiTBlock(nn.Module):
         self.alpha_scale=nn.Parameter(torch.tensor(10.0))
 
         self.apply(weight_init)
+
+    def _init_adaln(self):
+        for ada_layer in [self.adaLN_t2a, self.adaLN_pl2a, self.adaLN_a2a, self.adaLN_seg]:
+            nn.init.zeros_(ada_layer[-1].weight)
+            nn.init.zeros_(ada_layer[-1].bias)
 
     @staticmethod
     def _expand_edge_index(edge_index: torch.Tensor, K: int, bipartite: bool) -> torch.Tensor:
@@ -148,8 +149,10 @@ class QCNetDiTBlock(nn.Module):
         x_flat = x.reshape(N_a * K, self.hidden_dim)                
         t_emb_flat = t_emb_s.reshape(N_a * K, self.hidden_dim)
         t_scalar_exp = t_scalar.unsqueeze(1).expand(-1, K).reshape(N_a * K, 1)
-        #alpha = torch.sigmoid(10.0 * (t_scalar_exp - 0.3))
-        alpha=torch.sigmoid(self.alpha_scale*(t_scalar_exp-self.alpha_bias))
+        #scale = F.softplus(self.alpha_bias) + 1e-4
+        #bias = torch.sigmoid(self.alpha_bias)
+        alpha=torch.sigmoid(self.alpha_scale * (t_scalar_exp - self.alpha_bias))
+        #alpha=torch.sigmoid(scale * (t_scalar_exp - bias))
 
         freq_emb_flat = freq_pos_emb.unsqueeze(0).expand(N_a, K, self.hidden_dim).reshape(N_a * K, self.hidden_dim)
         x_m_flat = x_m.unsqueeze(1).expand(-1, K, -1).reshape(N_a * K, self.hidden_dim)
@@ -230,7 +233,7 @@ class AsymmetricVelocityHead(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim // 2, output_dim)
         )
-        self._init_weights()
+        self.apply(weight_init)
 
     def _init_weights(self):
         nn.init.zeros_(self.residual[-1].weight)
@@ -339,6 +342,8 @@ class QCNetFMDecoder(nn.Module):
         )
 
         self.apply(weight_init)
+        for block in self.blocks: block._init_adaln()
+        self.to_vel._init_weights()
 
     def _build_graph_context(self,
                              data: HeteroData,
@@ -671,7 +676,7 @@ class QCNetFMDecoder(nn.Module):
                 use_xm = False
                 use_history = True
                 use_map = True
-                use_agent = True
+                use_agent = False
             elif layer_idx == 1:
                 use_xm = True
                 use_history = True
@@ -679,6 +684,7 @@ class QCNetFMDecoder(nn.Module):
                 use_agent = True
 
             elif layer_idx == 2:
+                use_xm = True
                 use_history = False
                 use_map = False
                 use_agent = True
