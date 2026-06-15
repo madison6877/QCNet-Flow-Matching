@@ -23,6 +23,7 @@ from predictors import QCNet, QCNetFM
 
 import torch
 import torch.multiprocessing
+from latent_regression_cache import make_latent_regression_loader
 # 强制多进程使用文件系统共享，避免 /dev/shm 内存不足导致的文件句柄丢失
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -35,13 +36,14 @@ if __name__ == '__main__':
 
     parser = ArgumentParser()
     parser.add_argument('--root', type=str, required=True)
+    parser.add_argument("--latent_cache_dir", type=str, default=None)
     parser.add_argument('--train_batch_size', type=int, required=True)
     parser.add_argument('--val_batch_size', type=int, required=True)
     parser.add_argument('--test_batch_size', type=int, required=True)
     parser.add_argument('--shuffle', type=bool, default=True)
     parser.add_argument('--num_workers', type=int, default=14)
     parser.add_argument('--pin_memory', type=bool, default=True)
-    parser.add_argument('--persistent_workers', type=bool, default=False)
+    parser.add_argument('--persistent_workers', type=bool, default=True)
     parser.add_argument('--train_raw_dir', type=str, default=None)
     parser.add_argument('--val_raw_dir', type=str, default=None)
     parser.add_argument('--test_raw_dir', type=str, default=None)
@@ -97,6 +99,9 @@ if __name__ == '__main__':
     if args.model_type == 'qcnet_fm' and args.vae_only:
         monitor_metric = 'val_vae_loss'
         monitor_mode = 'min'
+    elif (args.model_type == "qcnet_fm" and args.latent_regression_only):
+        monitor_metric = "val_latent_reg_loss"
+        monitor_mode = "min"
     elif args.model_type == 'qcnet_fm' and not args.scorer_only:
         monitor_metric = 'val_fm_loss'
         monitor_mode = 'min'
@@ -105,12 +110,33 @@ if __name__ == '__main__':
         monitor_mode = 'min'
     model_checkpoint = ModelCheckpoint(monitor=monitor_metric, mode=monitor_mode, save_top_k=5, save_last=True, save_weights_only=False)
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
-    trainer = pl.Trainer(accumulate_grad_batches=1, precision='bf16-mixed',
+    trainer = pl.Trainer(accumulate_grad_batches=2, precision='bf16-mixed',
                          accelerator=args.accelerator, devices=args.devices,
                          callbacks=[model_checkpoint, lr_monitor], max_epochs=args.max_epochs)
 
-    # VAE-only mode: use lightweight .pt DataLoader to bypass TargetBuilder CPU bottleneck
-    if args.model_type == 'qcnet_fm' and args.vae_only:
+    
+    if (args.model_type == "qcnet_fm" and args.latent_regression_only and args.latent_cache_dir is not None):
+        train_loader = make_latent_regression_loader(
+            cache_dir=args.latent_cache_dir,
+            split="train",
+            shuffle=True,
+            num_workers=min(args.num_workers, 4),
+        )
+
+        val_loader = make_latent_regression_loader(
+            cache_dir=args.latent_cache_dir,
+            split="val",
+            shuffle=False,
+            num_workers=min(args.num_workers, 4),
+        )
+
+        trainer.fit(
+            model,
+            train_dataloaders=train_loader,
+            val_dataloaders=val_loader,
+            ckpt_path=fit_ckpt_path,
+        )
+    elif args.model_type == 'qcnet_fm' and args.vae_only:
         if args.vae_processed_dir is None:
             raise ValueError('--vae_processed_dir must be set when vae_only=True')
         print(f'⚡ [Stage 0] Preprocessing VAE data to {args.vae_processed_dir}...')

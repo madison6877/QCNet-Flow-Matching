@@ -97,8 +97,8 @@ class QCNetDiTBlock(nn.Module):
         self.a2a_attn = AttentionLayer(hidden_dim=hidden_dim, num_heads=num_heads, head_dim=head_dim,
                                        dropout=dropout, bipartite=False, has_pos_emb=True)
         self.seg_attn = TransformerLayer(hidden_dim=hidden_dim, num_heads=num_heads, dropout=dropout)
-        self.alpha_bias=nn.Parameter(torch.tensor(0.3))
-        self.alpha_scale=nn.Parameter(torch.tensor(10.0))
+        #self.alpha_bias=nn.Parameter(torch.tensor(0.3))
+        #self.alpha_scale=nn.Parameter(torch.tensor(10.0))
 
         self.apply(weight_init)
 
@@ -148,10 +148,16 @@ class QCNetDiTBlock(nn.Module):
         N_a = x.size(0)
         x_flat = x.reshape(N_a * K, self.hidden_dim)                
         t_emb_flat = t_emb_s.reshape(N_a * K, self.hidden_dim)
-        t_scalar_exp = t_scalar.unsqueeze(1).expand(-1, K).reshape(N_a * K, 1)
+
+        #t_scalar_exp = t_scalar.unsqueeze(1).expand(-1, K).reshape(N_a * K, 1) 
+
         #scale = F.softplus(self.alpha_bias) + 1e-4
         #bias = torch.sigmoid(self.alpha_bias)
-        alpha=torch.sigmoid(self.alpha_scale * (t_scalar_exp - self.alpha_bias))
+        
+        
+        #alpha=torch.sigmoid(self.alpha_scale * (t_scalar_exp - self.alpha_bias)) 
+        
+        
         #alpha=torch.sigmoid(scale * (t_scalar_exp - bias))
 
         freq_emb_flat = freq_pos_emb.unsqueeze(0).expand(N_a, K, self.hidden_dim).reshape(N_a * K, self.hidden_dim)
@@ -195,9 +201,10 @@ class QCNetDiTBlock(nn.Module):
             shift3_f, scale3_f, gate3_f = ss3_a2a[3], ss3_a2a[4], ss3_a2a[5]
             x_mod = self.norm3(x_flat) * (1.0 + scale3_a) + shift3_a
             r_norm = self.a2a_attn.attn_prenorm_r(r_a2a_exp) if (self.a2a_attn.has_pos_emb and r_a2a_exp is not None) else None
-            x_m_normed = self.norm3(x_m_flat) * (1.0 + scale3_a) + shift3_a
-            x_src_progressive = (1.0 - alpha) * x_m_normed + alpha * x_mod
-            attn_out = self.a2a_attn._attn_block(x_src=x_src_progressive, x_dst=x_mod, r=r_norm, edge_index=edge_index_a2a_exp, edge_gate=edge_threat_exp)
+            #x_m_normed = self.norm3(x_m_flat) * (1.0 + scale3_a) + shift3_a
+            #x_src = (1.0 - alpha) * x_m_normed + alpha * x_mod
+            x_src = self.a2a_attn.attn_prenorm_x_src(x_m_flat)
+            attn_out = self.a2a_attn._attn_block(x_src=x_src, x_dst=x_mod, r=r_norm, edge_index=edge_index_a2a_exp, edge_gate=edge_threat_exp)
             x_flat = x_flat + gate3_a * attn_out
             ff_in = self.a2a_attn.ff_prenorm(x_flat) * (1.0 + scale3_f) + shift3_f  
             ff_out = self.a2a_attn._ff_block(ff_in)

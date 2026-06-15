@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -41,7 +41,8 @@ class VAELoss(nn.Module):
                 mu: torch.Tensor,
                 logvar: torch.Tensor,
                 target_x: torch.Tensor,
-                mask: torch.Tensor = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+                mask: torch.Tensor = None,
+                beta: Optional[float] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
       
         # 先算原始的 MSE 矩阵 (不求和)
         recon_loss_raw = F.mse_loss(recon_x, target_x, reduction='none')  # [N_a, T_f, D]
@@ -53,9 +54,11 @@ class VAELoss(nn.Module):
             num_valid_agents = valid_agent_mask.sum().clamp(min=1) 
 
             # ---- 1. Recon 重构损失计算 ----
-            # 每个 agent 的所有有效坐标点 MSE 总和，然后对有效 agent 取平均
-            per_elem_sum = (recon_loss_raw * mask.unsqueeze(-1)).sum(dim=(1, 2))
-            recon_loss = per_elem_sum[valid_agent_mask].mean()
+            mask_f = mask.unsqueeze(-1).to(recon_loss_raw.dtype)
+            per_agent_sum = (recon_loss_raw * mask_f).sum(dim=(1, 2))
+            num_valid_coords = (mask.sum(dim=-1) * recon_x.size(-1)).clamp(min=1)
+            per_agent_mse = (per_agent_sum / num_valid_coords.to(per_agent_sum.dtype))
+            recon_loss = per_agent_mse[valid_agent_mask].mean() * 120
 
             # ---- 2. KL 散度损失计算 ----
             kl_per_agent = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=(0, 2))
@@ -87,11 +90,13 @@ class VAELoss(nn.Module):
                 ortho_loss = torch.tensor(0.0, device=mu.device)
 
         # ---- Total loss ----
-        total_loss = recon_loss + self.beta * kl_loss + self.gamma * ortho_loss
+        beta_now = self.beta if beta is None else float(beta)
+        total_loss = recon_loss + beta_now * kl_loss + self.gamma * ortho_loss
 
         return total_loss, {
             'loss_total': total_loss.detach(),
             'loss_recon': recon_loss.detach(),
             'loss_kl': kl_loss.detach(),
+            'vae_beta': beta_now,
             'ortho_aux': ortho_loss.detach(),
         }
