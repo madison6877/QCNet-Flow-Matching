@@ -282,9 +282,6 @@ class VAE(nn.Module):
         
         # 2. 可学习的时间查询基座 (保持不变)
         self.time_queries_base = nn.Parameter(torch.randn(num_future_steps, 1, hidden_dim) * 0.1)
-
-        self.register_buffer('time_pe', pe)
-
         self.intent_queries = nn.Parameter(torch.randn(num_intents, 1, hidden_dim) * 0.1)
 
         # ---- Reparameterization (shared MLP, after all encoder blocks) ----
@@ -296,8 +293,6 @@ class VAE(nn.Module):
 
         # ---- Decoder: Stacked VAEDecoderBlocks ----
         self.z_proj = nn.Linear(self.latent_dim, hidden_dim)
-        self.time_queries = nn.Parameter(torch.randn(num_future_steps, 1, hidden_dim))
-
         self.decoder_blocks = nn.ModuleList([
             VAEDecoderBlock(hidden_dim=hidden_dim, num_heads=num_heads, dropout=dropout)
             for _ in range(num_decoder_blocks)
@@ -327,15 +322,24 @@ class VAE(nn.Module):
         """
         N_a, T_f, D = x.shape
 
-        vel = torch.cat([torch.zeros(N_a, 1, D, device=x.device), 
-                         x[:, 1:, :] - x[:, :-1, :]], dim=1)
-        x_augmented = torch.cat([x, vel], dim=-1)
+        if predict_mask is None:
+            mask = torch.ones(N_a,T_f,dtype=torch.bool,device=x.device)
+        else:
+            mask = predict_mask.bool()
+        # 无效位置先清零
+        x_masked = x.masked_fill(~mask.unsqueeze(-1), 0.0)
+        vel = torch.zeros_like(x_masked)
+        # 只有相邻两个时间点都有效时，速度才有效
+        pair_valid = mask[:, 1:] & mask[:, :-1]
+        vel[:, 1:] = (x_masked[:, 1:] - x_masked[:, :-1]) * pair_valid.unsqueeze(-1)
+        x_augmented = torch.cat([x_masked, vel],dim=-1,)
 
         # 1. FourierEmbedding per timestep
         x_flat = x_augmented.view(N_a * T_f, self.input_dim * 2)
         x_emb = self.fourier_emb(continuous_inputs=x_flat, categorical_embs=None)
         x_emb = x_emb.view(N_a, T_f, self.hidden_dim)
         x_seq = x_emb.transpose(0, 1)  # [T_f, N_a, hidden_dim]
+        x_seq = x_seq + self.time_pe[:T_f].to(device=x_seq.device,dtype=x_seq.dtype,)
 
         intents = self.intent_queries.expand(-1, N_a, -1)  # [3, N_a, hidden_dim]
 

@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Batch
 from torch_geometric.data import HeteroData
+from utils import weight_init
 
 from losses import FlowMatchingLoss
 from losses import LatentFlowMatchingLoss
@@ -44,6 +45,34 @@ try:
 except ImportError:
     ChallengeSubmission = object
 
+class DeterministicLatentRegressor(nn.Module):
+
+    def __init__(self, hidden_dim: int, latent_dim: int, num_intents: int,) -> None:
+        super().__init__()
+
+        self.latent_dim = latent_dim
+        self.num_intents = num_intents
+
+        self.net = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, num_intents * latent_dim,)
+        )
+
+        self.apply(weight_init)
+
+        # 初始输出为标准化 latent 0，也就是 latent 均值。
+        last_layer = self.net[-1]
+        nn.init.zeros_(last_layer.weight)
+        nn.init.zeros_(last_layer.bias)
+
+    def forward(self, x_m: torch.Tensor) -> torch.Tensor:
+        n_agents = x_m.size(0)
+        z_pred = self.net(x_m)
+        return z_pred.view(n_agents,self.num_intents,self.latent_dim)
 
 class QCNetFM(pl.LightningModule):
 
@@ -80,9 +109,17 @@ class QCNetFM(pl.LightningModule):
                  vae_only: bool = False,
                  freeze_vae: bool = False,
                  vae_beta: float = 0.1,
+                 vae_kl_warmup_epochs: int = 10,
+                 vae_kl_start_beta: float = 0.0,
                  vae_gamma: float = 3.0,
                  vae_num_intents: int = 3,
                  band_weights: Optional[list] = None,
+                 latent_regression_only: bool = False,
+                 decoder_aux_ade_weight: float = 0.08,
+                 decoder_aux_fde_weight: float = 0.04,
+                 decoder_aux_warmup_epochs: int = 5,
+                 decoder_aux_focal_only: bool = True,
+                 trajectory_scale: float = 10.0,
                  **kwargs) -> None:
         super(QCNetFM, self).__init__()
         self.save_hyperparameters()
@@ -113,6 +150,8 @@ class QCNetFM(pl.LightningModule):
         self.vae_only = vae_only
         self.freeze_vae = freeze_vae
         self.vae_beta = vae_beta
+        self.vae_kl_warmup_epochs = vae_kl_warmup_epochs
+        self.vae_kl_start_beta = vae_kl_start_beta
         self.vae_gamma = vae_gamma
         self.vae_num_intents = vae_num_intents
         self.lr = lr
@@ -120,6 +159,16 @@ class QCNetFM(pl.LightningModule):
         self.T_max = T_max
         self.submission_dir = submission_dir
         self.submission_file_name = submission_file_name
+        self.latent_regression_only = latent_regression_only
+        self.decoder_aux_ade_weight = decoder_aux_ade_weight
+        self.decoder_aux_fde_weight = decoder_aux_fde_weight
+        self.decoder_aux_warmup_epochs = decoder_aux_warmup_epochs
+        self.decoder_aux_focal_only = decoder_aux_focal_only
+        self.trajectory_scale = trajectory_scale
+
+        num_active_special_modes = sum([bool(self.vae_only),bool(self.scorer_only),bool(self.latent_regression_only)])
+        if num_active_special_modes > 1:
+            raise ValueError("vae_only、scorer_only 和 latent_regression_only ""不能同时启用。")
 
         self.encoder = QCNetEncoder(
             dataset=dataset,
@@ -181,8 +230,8 @@ class QCNetFM(pl.LightningModule):
 
         self.test_predictions = dict()
 
-        means = [-0.0294,  0.0605, -0.0145, -0.0150, -0.0907]
-        stds  = [ 1.0592,  0.8184,  0.6869,  0.4002,  0.6022]
+        means = [0.0127,  0.0080,  -0.0431,  -0.0108,  0.0138]
+        stds  = [0.5870,  1.0910,   0.9122,  0.7358,  0.7219]
         self.register_buffer('z_mean', torch.tensor(means, dtype=torch.float32).view(1, 1, -1))
         self.register_buffer('z_std', torch.tensor(stds, dtype=torch.float32).view(1, 1, -1))
 
@@ -198,22 +247,129 @@ class QCNetFM(pl.LightningModule):
                 return self.decoder(z_unnorm, *args, **kwargs)
         self.latent_decoder = UnnormDecoderWrapper(self.latent_decoder, self.z_mean, self.z_std)
 
+        if self.latent_regression_only:
+            self.latent_regressor = DeterministicLatentRegressor(hidden_dim=self.hidden_dim,latent_dim=self.latent_dim,num_intents=self.vae_num_intents)
+        else:
+            self.latent_regressor = None
+        if self.freeze_vae:
+            for param in self.latent_encoder.parameters():
+                param.requires_grad_(False)
+            for param in self.latent_decoder.parameters():
+                param.requires_grad_(False)
+            
+    def _training_step_latent_regression_cached(self, batch, batch_idx):
+        
+        # Lightning 会自动把字典中的 tensor 搬到 GPU
+        x_m = batch["x_m"]
+        z_target_std = batch["z_target_std"]
+
+        z_pred_std = self.latent_regressor(x_m)
+        error = z_pred_std - z_target_std
+
+        # 与当前 FM loss 类似：K 和 latent dim 求和，agent 求平均
+        per_agent_loss = error.pow(2).sum(dim=(-1, -2))
+        loss = per_agent_loss.mean()
+
+        latent_mse = error.pow(2).mean()
+        latent_rmse = latent_mse.clamp_min(1e-12).sqrt()
+
+        self.log("train_latent_reg_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=x_m.size(0))
+        self.log("train_latent_reg_rmse", latent_rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=x_m.size(0))
+
+        return loss
+
+    @torch.no_grad()
+    def _get_standardized_latent_target(self, target: torch.Tensor, predict_mask: torch.Tensor) -> torch.Tensor:
+
+        self.latent_encoder.eval()
+
+        z_target_raw = self.latent_encoder.encode(target, predict_mask=predict_mask)
+        z_target_std = (z_target_raw - self.z_mean) / (self.z_std + 1e-6)
+
+        return z_target_std
+
+
     def forward(self, data: HeteroData, scene_enc: dict, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         v_theta = self.fm_decoder(data, scene_enc, x_t, t)
         return v_theta
+    
 
-    # def train_dataloader(self):
-    #     """Override default DataLoader for VAE-only training.
+    def _get_decoder_aux_scale(self) -> float:
+        if self.decoder_aux_warmup_epochs <= 0:
+            return 1.0
 
-    #     When vae_only=True, returns the lightweight VAE DataLoader (tiny .pt files)
-    #     instead of the full HeteroData DataLoader.  This bypasses the heavy .pkl
-    #     deserialization + TargetBuilder CPU bottleneck.
-    #     """
-    #     if self.vae_only:
-    #         return self.trainer.datamodule.vae_train_dataloader()
-    #     return super().train_dataloader()
+        return min(1.0, float(self.current_epoch + 1) / float(self.decoder_aux_warmup_epochs))
+    
+    def _get_current_vae_beta(self) -> float:
+        if self.vae_kl_warmup_epochs <= 0:
+            return float(self.vae_beta)
+        
+        if self.trainer is None:
+            return float(self.vae_beta)
+
+        num_batches = self.trainer.num_training_batches
+
+        if not isinstance(num_batches, int) or num_batches <= 0:
+            progress = min(float(self.current_epoch)/ max(float(self.vae_kl_warmup_epochs), 1.0), 1.0)
+        else:
+            warmup_steps = max(1,self.vae_kl_warmup_epochs * num_batches)
+            progress = min(float(self.global_step) / float(warmup_steps),1.0)
+            
+        beta_now = self.vae_kl_start_beta + progress * (self.vae_beta - self.vae_kl_start_beta)
+
+        return float(beta_now)
+    
+    
+    def _decoder_aware_trajectory_loss(self, v_theta: torch.Tensor, x_0: torch.Tensor, target: torch.Tensor, 
+                                       predict_mask: torch.Tensor, category: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+        future_valid_mask = predict_mask.any(dim=-1)
+
+        if self.decoder_aux_focal_only:
+            aux_agent_mask = (category == 3) & future_valid_mask
+        else:
+            aux_agent_mask = future_valid_mask
+
+        num_aux_agents = int(aux_agent_mask.sum().item())
+
+        if num_aux_agents == 0:
+            zero = v_theta.sum() * 0.0
+            return zero, zero, 0
+
+        # 对线性 FM：target velocity = z_target - x_0，所以 x_0 + v_theta 是预测的 endpoint latent。
+        z_pred_std = x_0[aux_agent_mask] + v_theta[aux_agent_mask]
+
+        # decoder 必须为 eval，但不能使用 no_grad，需要让梯度从轨迹误差穿过 decoder 返回 v_theta。
+        self.latent_decoder.eval()
+        traj_pred = self.latent_decoder(z_pred_std)
+
+        target_aux = target[aux_agent_mask]
+        mask_aux = predict_mask[aux_agent_mask].bool()
+
+        # decoder 输出和 target 都处于 /10 的归一化空间。转换成米后计算与正式指标同口径的距离。
+        error_m = (traj_pred[..., :self.output_dim] - target_aux[..., :self.output_dim]) * self.trajectory_scale
+        distance_m = torch.sqrt(error_m.pow(2).sum(dim=-1) + 1e-8)  # [N_aux, T_future]
+
+        mask_float = mask_aux.to(distance_m.dtype)
+        valid_steps = mask_float.sum(dim=-1).clamp_min(1.0)
+
+        # 每个 agent 先对有效时间点平均，再对 agent 平均。
+        ade_per_agent = (distance_m * mask_float).sum(dim=-1) / valid_steps
+        ade_loss_m = ade_per_agent.mean()
+
+        # 每个 agent 的最后一个有效未来点。
+        time_index = torch.arange(mask_aux.size(1), device=mask_aux.device).view(1, -1)
+        last_valid_index = time_index.masked_fill(~mask_aux, -1).max(dim=-1).values
+        agent_index = torch.arange(num_aux_agents, device=mask_aux.device)
+        fde_per_agent = distance_m[agent_index, last_valid_index]
+        fde_loss_m = fde_per_agent.mean()
+
+        return ade_loss_m, fde_loss_m, num_aux_agents
+
 
     def training_step(self, data, batch_idx):
+
+        if (self.latent_regression_only and isinstance(data, dict) and "x_m" in data):
+            return self._training_step_latent_regression_cached(data, batch_idx)
 
         if isinstance(data, Batch):
             data['agent']['av_index'] += data['agent']['ptr'][:-1]
@@ -223,6 +379,9 @@ class QCNetFM(pl.LightningModule):
 
         if self.scorer_only:
             return self._training_step_scorer(data)
+        
+        if self.latent_regression_only:
+            return self._training_step_latent_regression(data=data, batch_idx=batch_idx)
 
         # ---- Stage 1: Latent Flow Matching ----
         target = data['agent']['target'][..., :self.output_dim]
@@ -241,6 +400,12 @@ class QCNetFM(pl.LightningModule):
         agent_batch = data['agent'].get('batch', None)
         x_0, t = FlowMatchingLoss.sample_noise_and_time_latent(
             self.vae_num_intents, target.size(0), self.latent_dim, self.device, agent_batch)
+        if self.current_epoch == 0 and batch_idx == 0:
+            first_scene_mask = agent_batch == agent_batch[0]
+            print("first scene t:")
+            print(t[first_scene_mask][:20].detach().cpu())
+            print("unique t in first scene:")
+            print(torch.unique(t[first_scene_mask]).numel())
         # x_0: [N_a, 3, H], t: [N_a]
 
         # Linear interpolation in latent space: x_t = t * z_target + (1 - t) * x_0
@@ -260,11 +425,23 @@ class QCNetFM(pl.LightningModule):
         x_0_valid = x_0[valid_mask]
 
         # 只对有效的车辆计算 Flow Matching Loss
-        loss, loss_dict = self.latent_fm_loss(v_theta_valid, z_target_valid, x_0_valid)
-        loss = loss + 1000.0 * pinn_loss
+        fm_loss, loss_dict = self.latent_fm_loss(v_theta_valid, z_target_valid, x_0_valid)
+        fm_loss = fm_loss + 1000.0 * pinn_loss
+
+        aux_ade_m, aux_fde_m, num_aux_agents = self._decoder_aware_trajectory_loss(v_theta=v_theta, x_0=x_0, target=target, 
+                                                                                   predict_mask=predict_mask, category=data["agent"]["category"])
+        aux_scale = self._get_decoder_aux_scale()
+        weighted_aux_ade = aux_scale * self.decoder_aux_ade_weight * aux_ade_m
+        weighted_aux_fde = aux_scale * self.decoder_aux_fde_weight * aux_fde_m
+        loss = fm_loss + weighted_aux_ade + weighted_aux_fde
         
-        self.log('train_fm_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
-        self.log('train_pinn_loss', pinn_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
+        self.log('train_fm_loss', fm_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
+        self.log("train_decoder_aux_ADE_m", aux_ade_m, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1))
+        self.log("train_decoder_aux_FDE_m", aux_fde_m, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1))
+        self.log("train_decoder_aux_weighted", weighted_aux_ade + weighted_aux_fde, prog_bar=False, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1))
+        self.log("train_decoder_aux_scale", torch.tensor(aux_scale, device=self.device), prog_bar=False, on_step=False, on_epoch=True, batch_size=1)
+        self.log("train_total_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=int(valid_mask.sum()))
+        #self.log('train_pinn_loss', pinn_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
         # for k_name, v_loss in loss_dict.items():
         #     self.log(f'train_{k_name}', v_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
         
@@ -290,15 +467,17 @@ class QCNetFM(pl.LightningModule):
 
         #print(f"Train_Target_Mean: {target.mean()}")  
         recon_x, mu, logvar = self.latent_encoder(target, predict_mask=predict_mask)
-        loss, loss_dict = self.vae_loss(recon_x, mu, logvar, target, mask=predict_mask)
+        beta_now = self._get_current_vae_beta()
+        loss, loss_dict = self.vae_loss(recon_x, mu, logvar, target, mask=predict_mask, beta=beta_now)
          
 
         self.log('train_vae_loss', loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_vae_recon', loss_dict['loss_recon'], prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_vae_kl', loss_dict['loss_kl'], prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+        self.log('train_vae_beta', loss_dict['vae_beta'], prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
         self.log('train_vae_ortho', loss_dict['ortho_aux'], prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
         return loss
-
+    
     def _training_step_scorer(self, data):
         """Stage 2: train only the trajectory scorer."""
         target = data['agent']['target'][..., :self.output_dim]
@@ -323,8 +502,153 @@ class QCNetFM(pl.LightningModule):
         )
         self.log('train_scorer_loss', scorer_loss, prog_bar=False, on_step=True, on_epoch=True, batch_size=1)
         return scorer_loss
+    
+    def _training_step_latent_regression(self, data: HeteroData, batch_idx: int) -> torch.Tensor:
 
+        target = data["agent"]["target"][..., :self.output_dim] / 10.0
+        predict_mask = data["agent"]["predict_mask"][:, self.num_historical_steps:].bool()
+        valid_agent_mask = predict_mask.any(dim=-1)
+
+        if not valid_agent_mask.any():
+            return torch.zeros((), device=self.device, requires_grad=True)
+
+        self.encoder.eval()
+        self.latent_encoder.eval()
+        self.latent_decoder.eval()
+
+        with torch.no_grad():
+            scene_enc = self.encoder(data)
+            z_target_std = self._get_standardized_latent_target(target=target,predict_mask=predict_mask)
+
+        x_m = scene_enc["x_a"][:, -1, :]
+
+        z_pred_std = self.latent_regressor(x_m)
+        z_pred_valid = z_pred_std[valid_agent_mask]
+        z_target_valid = z_target_std[valid_agent_mask]
+
+        per_agent_se = (z_pred_valid - z_target_valid).pow(2).sum(dim=(-1, -2))
+        latent_reg_loss = per_agent_se.mean()
+        latent_mse = (z_pred_valid - z_target_valid).pow(2).mean()
+        latent_rmse = torch.sqrt(latent_mse.clamp_min(1e-12))
+
+        self.log("train_latent_reg_loss", latent_reg_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
+        self.log("train_latent_reg_rmse", latent_rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
+
+        return latent_reg_loss
+    
+    @torch.no_grad()
+    def _validation_step_latent_regression(self, data: HeteroData, batch_idx: int) -> None:
+        """Validation step for latent regression."""
+        target = data["agent"]["target"][..., :self.output_dim] / 10.0
+
+        predict_mask = data["agent"]["predict_mask"][:, self.num_historical_steps:].bool()
+        valid_agent_mask = predict_mask.any(dim=-1)
+
+        if not valid_agent_mask.any():
+            return
+
+        # Set all modules to evaluation mode
+        self.encoder.eval()
+        self.latent_encoder.eval()
+        self.latent_decoder.eval()
+        self.latent_regressor.eval()
+
+        # Encode scene and get standardized latent target
+        scene_enc = self.encoder(data)
+        z_target_std = self._get_standardized_latent_target(target=target, predict_mask=predict_mask)
+
+        # Predict latent representation
+        x_m = scene_enc["x_a"][:, -1, :]
+        z_pred_std = self.latent_regressor(x_m)
+
+        # Filter valid agents
+        z_pred_valid = z_pred_std[valid_agent_mask]
+        z_target_valid = z_target_std[valid_agent_mask]
+
+        # Compute latent regression loss and metrics
+        per_agent_se = (z_pred_valid - z_target_valid).pow(2).sum(dim=(-1, -2))
+        latent_reg_loss = per_agent_se.mean()
+
+        latent_mse = (z_pred_valid - z_target_valid).pow(2).mean()
+        latent_rmse = torch.sqrt(latent_mse.clamp_min(1e-12))
+
+        # Log latent regression metrics
+        self.log("val_latent_reg_loss", latent_reg_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
+        self.log("val_latent_reg_rmse", latent_rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
+
+        # Decode trajectories from predicted latent (wrapper handles inverse standardization)
+        traj_pred = self.latent_decoder(z_pred_std)  # Shape: [N_a, T_f, 2], scale: /10
+
+        # Determine evaluation mask based on dataset
+        if self.dataset == "argoverse_v2":
+            eval_mask = (data["agent"]["category"] == 3) & predict_mask.any(dim=-1)
+        else:
+            raise ValueError(f"Unsupported dataset: {self.dataset}")
+
+        if not eval_mask.any():
+            return
+
+        # Convert back to meters for evaluation
+        traj_eval = (traj_pred[eval_mask] * 10.0).unsqueeze(1)  # [N_eval, 1, T_f, 2]
+        gt_eval = target[eval_mask] * 10.0
+        valid_mask_eval = predict_mask[eval_mask]
+
+        # Single trajectory with probability 1
+        pi_eval = torch.ones(traj_eval.size(0), 1, device=traj_eval.device, dtype=traj_eval.dtype)
+
+        # Update metrics
+        self.minADE.update(pred=traj_eval, target=gt_eval, prob=pi_eval, valid_mask=valid_mask_eval)
+        self.minFDE.update(pred=traj_eval, target=gt_eval, prob=pi_eval, valid_mask=valid_mask_eval)
+        self.MR.update(pred=traj_eval, target=gt_eval, prob=pi_eval, valid_mask=valid_mask_eval)
+
+        # Log evaluation metrics
+        self.log("val_reg_ADE1", self.minADE, prog_bar=True, on_step=False, on_epoch=True, batch_size=gt_eval.size(0), sync_dist=True)
+        self.log("val_reg_FDE1", self.minFDE, prog_bar=True, on_step=False, on_epoch=True, batch_size=gt_eval.size(0), sync_dist=True)
+        self.log("val_reg_MR1", self.MR, prog_bar=True, on_step=False, on_epoch=True, batch_size=gt_eval.size(0), sync_dist=True)
+
+    @torch.no_grad()
+    def _validation_step_latent_regression_cached(self, batch, batch_idx):
+        """Validation step for latent regression using cached data."""
+        x_m = batch["x_m"]
+        z_target_std = batch["z_target_std"]
+        target = batch["target"]
+        predict_mask = batch["predict_mask"].bool()
+        eval_mask = batch["eval_mask"].bool()
+
+        z_pred_std = self.latent_regressor(x_m)
+        error = z_pred_std - z_target_std
+
+        latent_loss = error.pow(2).sum(dim=(-1, -2)).mean()
+        latent_rmse = error.pow(2).mean().clamp_min(1e-12).sqrt()
+
+        self.log("val_latent_reg_loss", latent_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=x_m.size(0), sync_dist=True)
+        self.log("val_latent_reg_rmse", latent_rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=x_m.size(0), sync_dist=True)
+
+        # latent_decoder 接收标准化 latent，wrapper 内部会自动反标准化
+        trajectory = self.latent_decoder(z_pred_std)
+
+        if not eval_mask.any():
+            return
+
+        pred_eval = (trajectory[eval_mask] * 10.0).unsqueeze(1)  # [N_eval, 1, 60, 2]
+        target_eval = target[eval_mask] * 10.0
+        mask_eval = predict_mask[eval_mask]
+
+        probability = torch.ones(pred_eval.size(0), 1, device=pred_eval.device, dtype=pred_eval.dtype)
+
+        self.minADE.update(pred=pred_eval, target=target_eval, prob=probability, valid_mask=mask_eval)
+        self.minFDE.update(pred=pred_eval, target=target_eval, prob=probability, valid_mask=mask_eval)
+        self.MR.update(pred=pred_eval, target=target_eval, prob=probability, valid_mask=mask_eval)
+
+        self.log("val_reg_ADE1", self.minADE, prog_bar=True, on_step=False, on_epoch=True, batch_size=target_eval.size(0), sync_dist=True)
+        self.log("val_reg_FDE1", self.minFDE, prog_bar=True, on_step=False, on_epoch=True, batch_size=target_eval.size(0), sync_dist=True)
+        self.log("val_reg_MR1", self.MR, prog_bar=True, on_step=False, on_epoch=True, batch_size=target_eval.size(0), sync_dist=True)
+    
     def validation_step(self, data, batch_idx):
+
+        if (self.latent_regression_only and isinstance(data, dict) and "x_m" in data):
+            return self._validation_step_latent_regression_cached(data,batch_idx)
+
         if isinstance(data, Batch):
             data['agent']['av_index'] += data['agent']['ptr'][:-1]
 
@@ -339,16 +663,18 @@ class QCNetFM(pl.LightningModule):
 
             with torch.no_grad():
                 recon_x, mu, logvar = self.latent_encoder(target, predict_mask=predict_mask)
-                loss, loss_dict = self.vae_loss(recon_x, mu, logvar, target, mask=predict_mask)
+                beta_now = self._get_current_vae_beta()
+                loss, loss_dict = self.vae_loss(recon_x, mu, logvar, target, mask=predict_mask, beta=beta_now)
 
             self.log('val_vae_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
-            self.log('val_vae_recon', loss_dict['loss_recon'], prog_bar=True, on_step=False, on_epoch=True,
-                     batch_size=1, sync_dist=True)
-            self.log('val_vae_kl', loss_dict['loss_kl'], prog_bar=True, on_step=False, on_epoch=True,
-                     batch_size=1, sync_dist=True)
-            self.log('val_vae_ortho', loss_dict['ortho_aux'], prog_bar=True, on_step=False, on_epoch=True,
-                     batch_size=1, sync_dist=True)
+            self.log('val_vae_recon', loss_dict['loss_recon'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+            self.log('val_vae_kl', loss_dict['loss_kl'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
+            self.log('val_vae_beta', loss_dict['vae_beta'], prog_bar=True, on_step=True, on_epoch=True, batch_size=1)
+            self.log('val_vae_ortho', loss_dict['ortho_aux'], prog_bar=True, on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
             return
+        
+        if self.latent_regression_only:
+            return self._validation_step_latent_regression(data=data, batch_idx=batch_idx)
 
         target = data['agent']['target'][..., :self.output_dim]
         target = target / 10.0
@@ -380,11 +706,16 @@ class QCNetFM(pl.LightningModule):
         x_0_valid = x_0[valid_mask]
 
         # 只对有效的车辆计算 Flow Matching Loss
-        loss, loss_dict = self.latent_fm_loss(v_theta_valid, z_target_valid, x_0_valid)
-        loss = loss + 1000.0 * pinn_loss
+        fm_loss, loss_dict = self.latent_fm_loss(v_theta_valid, z_target_valid, x_0_valid)
+        fm_loss = fm_loss + 1000.0 * pinn_loss
+
+        aux_ade_m, aux_fde_m, num_aux_agents = self._decoder_aware_trajectory_loss(v_theta=v_theta,x_0=x_0,target=target,
+                                                                                   predict_mask=predict_mask,category=data["agent"]["category"])
         
-        self.log('val_fm_loss', loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
-        self.log('val_pinn_loss', pinn_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
+        self.log('val_fm_loss', fm_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
+        self.log("val_decoder_aux_ADE_m", aux_ade_m, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1), sync_dist=True,)
+        self.log("val_decoder_aux_FDE_m", aux_fde_m, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1), sync_dist=True)
+        #self.log('val_pinn_loss', pinn_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
         # for k_name, v_loss in loss_dict.items():
         #     self.log(f'val_{k_name}', v_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
 
@@ -532,7 +863,16 @@ class QCNetFM(pl.LightningModule):
              "weight_decay": 0.0},
         ]
 
-        if self.vae_only:
+        if self.latent_regression_only:
+            reg_decay = {p for p in decay if "latent_regressor" in p}
+            reg_no_decay = {p for p in no_decay if "latent_regressor" in p}
+
+            optim_groups = [
+                {"params": [param_dict[p] for p in sorted(reg_decay)], "weight_decay": self.weight_decay},
+                {"params": [param_dict[p] for p in sorted(reg_no_decay)], "weight_decay": 0.0},
+            ]
+        
+        elif self.vae_only:
             # Stage 0: only optimize latent_encoder parameters
             vae_decay = {p for p in decay if 'latent_encoder' in p}
             vae_no_decay = {p for p in no_decay if 'latent_encoder' in p}
@@ -564,18 +904,20 @@ class QCNetFM(pl.LightningModule):
             ]
         # else: default — optim_groups already built above from all params
         optimizer = torch.optim.AdamW(optim_groups, lr=self.lr, weight_decay=self.weight_decay)
-        if getattr(self, 'vae_only', False):
+        if self.latent_regression_only:
+            warmup_epochs = 1
+        elif getattr(self, 'vae_only', False):
             warmup_epochs = 1  # Stage 0 (VAE): 梯度平稳，给 1 个 Epoch 象征性热身即可
         elif getattr(self, 'scorer_only', False):
             warmup_epochs = 1  # Stage 2 (Scorer): 只训练打分器，1 个 Epoch 足够
         else:
-            warmup_epochs = 3  # Stage 1 (FM): 核心潜空间流匹配，必须给足 3 个 Epoch 防爆
+            warmup_epochs = 1  # Stage 1 (FM): 核心潜空间流匹配，必须给足 3 个 Epoch 防爆
 
         # 2. 安全构建调度器 (加入 VAE 与 FM 的调度分流)
         if warmup_epochs > 0:
             warmup_scheduler = LinearLR(
                 optimizer, 
-                start_factor=0.01, 
+                start_factor=0.3, 
                 total_iters=warmup_epochs
             )
             cosine_scheduler = CosineAnnealingLR(
@@ -620,6 +962,9 @@ class QCNetFM(pl.LightningModule):
         parser.add_argument('--scorer_only', action='store_true', default=False)
         parser.add_argument('--vae_only', action='store_true', default=False)
         parser.add_argument('--freeze_vae', action='store_true', default=False)
+        parser.add_argument("--latent_regression_only", action="store_true", default=False)
+        parser.add_argument('--vae_kl_warmup_epochs', type=int, default=10)
+        parser.add_argument('--vae_kl_start_beta', type=float,default=0.0)
         parser.add_argument('--vae_beta', type=float, default=0.01)
         parser.add_argument('--vae_gamma', type=float, default=0.1)
         parser.add_argument('--vae_num_intents', type=int, default=3)
@@ -636,6 +981,11 @@ class QCNetFM(pl.LightningModule):
         parser.add_argument('--T_max', type=int, default=64)
         parser.add_argument('--submission_dir', type=str, default='./')
         parser.add_argument('--submission_file_name', type=str, default='submission')
+        parser.add_argument("--decoder_aux_ade_weight", type=float, default=0.08)
+        parser.add_argument("--decoder_aux_fde_weight", type=float, default=0.04)
+        parser.add_argument("--decoder_aux_warmup_epochs", type=int, default=5)
+        parser.add_argument("--decoder_aux_focal_only", action="store_true", default=False)
+        parser.add_argument("--trajectory_scale", type=float, default=10.0)
         return parent_parser
 
 

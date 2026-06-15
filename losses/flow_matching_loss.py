@@ -49,12 +49,16 @@ class FlowMatchingLoss(nn.Module):
                                      agent_batch: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
 
         x_0 = torch.randn(N_a, num_intents, hidden_dim, device=device)
+        
         if agent_batch is None:
             t = torch.rand(N_a, device=device)
         else:
             B = int(agent_batch.max().item()) + 1
             t_scene = torch.rand(B, device=device)
             t = t_scene[agent_batch]
+
+        #每个 agent 独立采样 t_i ~ Uniform(0, 1)
+        #t = torch.rand(N_a,device=device)
         return x_0, t
 
     def forward(self,
