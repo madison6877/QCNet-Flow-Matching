@@ -48,7 +48,6 @@ class LatentSpaceEncoder(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
         )
-        self.apply(weight_init)
 
     def forward(self, x: torch.Tensor, return_latent: bool = False, predict_mask: torch.Tensor = None) -> \
             Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

@@ -57,6 +57,7 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt_path', type=str, default=None)
     parser.add_argument('--vae_processed_dir', type=str, default=None)
     parser.add_argument('--resume', action='store_true', default=False)
+    parser.add_argument("--vae_weights_path", type=str, default=None)
     # parse known args to determine model class before adding model-specific args
     known_args, _ = parser.parse_known_args()
     model_cls = QCNetFM if known_args.model_type == 'qcnet_fm' else QCNet
@@ -66,6 +67,54 @@ if __name__ == '__main__':
         'argoverse_v2': ArgoverseV2DataModule,
     }[args.dataset](**vars(args))
     model = model_cls(**vars(args))
+    if args.model_type == "qcnet_fm" and args.vae_weights_path is not None:
+        print(f"[VAE] Loading geometry-aware VAE from: {args.vae_weights_path}")
+
+        vae_payload = torch.load(args.vae_weights_path, map_location="cpu")
+
+        required_keys = {"latent_encoder", "z_mean", "z_std"}
+        missing_payload_keys = required_keys - set(vae_payload.keys())
+        if missing_payload_keys:
+            raise RuntimeError(f"VAE weights file is missing keys: {sorted(missing_payload_keys)}")
+
+        # 直接加载嵌套的 latent_encoder state_dict，不能把整个 vae_payload 传给 model.load_state_dict。
+        incompatible = model.latent_encoder.load_state_dict(vae_payload["latent_encoder"], strict=True)
+
+        if incompatible.missing_keys:
+            raise RuntimeError(f"Missing latent_encoder keys: {incompatible.missing_keys}")
+        if incompatible.unexpected_keys:
+            raise RuntimeError(f"Unexpected latent_encoder keys: {incompatible.unexpected_keys}")
+
+        loaded_mean = vae_payload["z_mean"].reshape_as(model.z_mean)
+        loaded_std = vae_payload["z_std"].reshape_as(model.z_std)
+
+        with torch.no_grad():
+            model.z_mean.copy_(loaded_mean.to(device=model.z_mean.device, dtype=model.z_mean.dtype))
+            model.z_std.copy_(loaded_std.to(device=model.z_std.device, dtype=model.z_std.dtype))
+
+            # 当前 UnnormDecoderWrapper 保存了自己的 mean/std 引用。显式同步，防止 decoder 使用旧 VAE 的统计量。
+            if hasattr(model.latent_decoder, "mean"):
+                model.latent_decoder.mean.copy_(loaded_mean.to(device=model.latent_decoder.mean.device, dtype=model.latent_decoder.mean.dtype))
+            if hasattr(model.latent_decoder, "std"):
+                model.latent_decoder.std.copy_(loaded_std.to(device=model.latent_decoder.std.device, dtype=model.latent_decoder.std.dtype))
+
+        print("[VAE] Geometry-aware VAE loaded successfully.")
+        print("[VAE] z_mean:", model.z_mean.flatten().tolist())
+        print("[VAE] z_std :", model.z_std.flatten().tolist())
+
+        if hasattr(model.latent_decoder, "mean"):
+            mean_error = (model.latent_decoder.mean.cpu() - model.z_mean.cpu()).abs().max()
+            std_error = (model.latent_decoder.std.cpu() - model.z_std.cpu()).abs().max()
+
+            print("[VAE] decoder/stat mean max error:", float(mean_error))
+            print("[VAE] decoder/stat std max error:", float(std_error))
+
+            if mean_error > 1e-7 or std_error > 1e-7:
+                raise RuntimeError("Decoder latent statistics are not synchronized.")
+
+        # LatentSpaceDecoder 与 LatentSpaceEncoder 必须共享同一个 VAE。
+        if hasattr(model.latent_decoder, "decoder"):
+            assert model.latent_decoder.decoder.vae is model.latent_encoder.vae, "latent encoder and decoder do not share the same VAE"
     fit_ckpt_path = None
     if args.ckpt_path is not None:
         if args.resume:

@@ -39,6 +39,7 @@ from modules import QCNetFMDecoder
 from modules import LatentSpaceEncoder
 from modules import LatentSpaceDecoder
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR, MultiStepLR
+from losses.vae_geometry_regularizer import FiniteDifferenceGeometryLoss
 
 try:
     from av2.datasets.motion_forecasting.eval.submission import ChallengeSubmission

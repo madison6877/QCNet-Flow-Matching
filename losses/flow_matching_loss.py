@@ -83,19 +83,6 @@ class FlowMatchingLoss(nn.Module):
 
 
 class LatentFlowMatchingLoss(nn.Module):
-    """潜空间多频段流匹配损失。
-
-    计算 K 个频段速度预测与目标速度的加权 MSE。
-    权重可通过 band_weights 调节各频段的重要性。
-
-    Input:
-        pred:     [N_a, K, H]  速度场预测 (DiT 输出)
-        z_target: [N_a, K, H]  目标潜向量 (VAE Encoder 产物)
-        x_0:      [N_a, K, H]  初始噪声
-
-    Returns:
-        loss: scalar  加权平方误差总和
-    """
 
     def __init__(self, band_weights: Optional[torch.Tensor] = None) -> None:
         super(LatentFlowMatchingLoss, self).__init__()

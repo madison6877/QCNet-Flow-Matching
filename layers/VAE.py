@@ -17,9 +17,48 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from layers.fourier_embedding import FourierEmbedding
 from utils import weight_init
+
+class LearnableEndpointGate(nn.Module):
+    def __init__(self, 
+                 initial_bias: float = 0.70, 
+                 initial_sharpness: float = 15.0, 
+                 min_bias: float = 0.50, 
+                 max_bias: float = 0.90, 
+                 min_sharpness: float = 1.0, 
+                 eps: float = 1e-6) -> None:
+        super().__init__()
+
+        self.min_bias = float(min_bias)
+        self.max_bias = float(max_bias)
+        self.min_sharpness = float(min_sharpness)
+        self.eps = float(eps)
+
+        bias_ratio = (initial_bias - min_bias) / (max_bias - min_bias)
+        bias_ratio = min(max(bias_ratio, 1e-4), 1.0 - 1e-4)
+
+        self.bias_raw = nn.Parameter(torch.tensor(math.log(bias_ratio / (1.0 - bias_ratio)), dtype=torch.float32))
+
+        sharpness_target = max(initial_sharpness - min_sharpness, 1e-4)
+        self.sharpness_raw = nn.Parameter(torch.tensor(math.log(math.exp(sharpness_target) - 1.0), dtype=torch.float32))
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        # b 始终限制在 [0.50, 0.90]
+        bias = self.min_bias + (self.max_bias - self.min_bias) * torch.sigmoid(self.bias_raw)
+
+        # k 始终为正
+        sharpness = self.min_sharpness + F.softplus(self.sharpness_raw)
+
+        value = torch.sigmoid(sharpness * (s - bias))
+        value_at_zero = torch.sigmoid(-sharpness * bias)
+        value_at_one = torch.sigmoid(sharpness * (1.0 - bias))
+
+        gate = (value - value_at_zero) / (value_at_one - value_at_zero).clamp_min(self.eps)
+
+        return gate.clamp(0.0, 1.0)
 
 
 class VAEEncoderBlock(nn.Module):
@@ -307,7 +346,18 @@ class VAE(nn.Module):
             nn.Linear(hidden_dim // 2, input_dim),
         )
 
+        self.endpoint_delta_head = nn.Sequential(
+            nn.LayerNorm(self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim // 2, self.input_dim),
+        )
+        
+        self.endpoint_gate = LearnableEndpointGate()
+
         self.apply(weight_init)
+        nn.init.zeros_(self.endpoint_delta_head[-1].weight)
+        nn.init.zeros_(self.endpoint_delta_head[-1].bias)
 
     def encode(self, x: torch.Tensor, predict_mask: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode future trajectories into latent distribution parameters.
@@ -378,14 +428,6 @@ class VAE(nn.Module):
             recon_x: [N_a, T_f, 2] reconstructed trajectories.
         """
         N_a = z.size(1)
-        # 🌟 强行打破垄断：训练阶段，随机“遮蔽”或“打乱” Token
-        # if self.training:
-        #     # 策略：30% 的概率随机扔掉部分 Token，强迫解码器寻找其他信息来源
-        #     # 这是一个简单的 Dropout 变种，但作用在潜空间 Token 上
-        #     if torch.rand(1) < 0.2:
-        #         # 随机选择一个 Token 索引进行屏蔽
-        #         drop_idx = torch.randint(0, self.num_intents, (1,)).item()
-        #         z[drop_idx, :, :] = 0
         z = self.z_proj(z)  # [3, N_a, hidden_dim] → projected to hidden_dim for cross-attention
 
         # Expand learnable time queries (shared across all decoder blocks)
@@ -396,10 +438,17 @@ class VAE(nn.Module):
             time_q = dec_block(time_q, z)
 
         # 2. MLP → coordinates
-        recon_seq = self.decoder_mlp(time_q)  # [T_f, N_a, 2]
-        recon_x = recon_seq.transpose(0, 1)   # [N_a, T_f, 2]
+        raw_trajectory = self.decoder_mlp(time_q).transpose(0, 1)   # [N_a, T_f, 2]
 
-        return recon_x
+        endpoint_feature = time_q[-1]
+        endpoint_delta = self.endpoint_delta_head(endpoint_feature) 
+        endpoint = raw_trajectory[:, -1, :] + endpoint_delta
+        s = torch.arange(1, self.num_future_steps + 1, device=raw_trajectory.device, dtype=raw_trajectory.dtype,) / float(self.num_future_steps)
+        gate = self.endpoint_gate(s).view(1, self.num_future_steps, 1)
+        corrected_trajectory = raw_trajectory + gate * endpoint_delta.unsqueeze(1)
+        corrected_trajectory = torch.cat([corrected_trajectory[:, :-1], endpoint.unsqueeze(1)], dim=1)
+
+        return corrected_trajectory
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Full VAE forward pass.
