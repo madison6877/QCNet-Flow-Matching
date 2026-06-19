@@ -22,45 +22,6 @@ import torch.nn.functional as F
 from layers.fourier_embedding import FourierEmbedding
 from utils import weight_init
 
-class LearnableEndpointGate(nn.Module):
-    def __init__(self, 
-                 initial_bias: float = 0.70, 
-                 initial_sharpness: float = 15.0, 
-                 min_bias: float = 0.50, 
-                 max_bias: float = 0.90, 
-                 min_sharpness: float = 1.0, 
-                 eps: float = 1e-6) -> None:
-        super().__init__()
-
-        self.min_bias = float(min_bias)
-        self.max_bias = float(max_bias)
-        self.min_sharpness = float(min_sharpness)
-        self.eps = float(eps)
-
-        bias_ratio = (initial_bias - min_bias) / (max_bias - min_bias)
-        bias_ratio = min(max(bias_ratio, 1e-4), 1.0 - 1e-4)
-
-        self.bias_raw = nn.Parameter(torch.tensor(math.log(bias_ratio / (1.0 - bias_ratio)), dtype=torch.float32))
-
-        sharpness_target = max(initial_sharpness - min_sharpness, 1e-4)
-        self.sharpness_raw = nn.Parameter(torch.tensor(math.log(math.exp(sharpness_target) - 1.0), dtype=torch.float32))
-
-    def forward(self, s: torch.Tensor) -> torch.Tensor:
-        # b 始终限制在 [0.50, 0.90]
-        bias = self.min_bias + (self.max_bias - self.min_bias) * torch.sigmoid(self.bias_raw)
-
-        # k 始终为正
-        sharpness = self.min_sharpness + F.softplus(self.sharpness_raw)
-
-        value = torch.sigmoid(sharpness * (s - bias))
-        value_at_zero = torch.sigmoid(-sharpness * bias)
-        value_at_one = torch.sigmoid(sharpness * (1.0 - bias))
-
-        gate = (value - value_at_zero) / (value_at_one - value_at_zero).clamp_min(self.eps)
-
-        return gate.clamp(0.0, 1.0)
-
-
 class VAEEncoderBlock(nn.Module):
     """A single encoder block: Temporal SA → Intent SA → Intent×Trajectory CA.
 
@@ -322,6 +283,8 @@ class VAE(nn.Module):
         # 2. 可学习的时间查询基座 (保持不变)
         self.time_queries_base = nn.Parameter(torch.randn(num_future_steps, 1, hidden_dim) * 0.1)
         self.intent_queries = nn.Parameter(torch.randn(num_intents, 1, hidden_dim) * 0.1)
+        self.endpoint_query = nn.Parameter(torch.randn(1, 1, hidden_dim) * 0.1)
+
 
         # ---- Reparameterization (shared MLP, after all encoder blocks) ----
         self.reparam_mlp = nn.Sequential(
@@ -346,14 +309,19 @@ class VAE(nn.Module):
             nn.Linear(hidden_dim // 2, input_dim),
         )
 
-        self.endpoint_delta_head = nn.Sequential(
-            nn.LayerNorm(self.hidden_dim),
-            nn.Linear(self.hidden_dim, self.hidden_dim // 2),
+        self.endpoint_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
-            nn.Linear(self.hidden_dim // 2, self.input_dim),
+            nn.Linear(hidden_dim // 2, input_dim),
         )
-        
-        self.endpoint_gate = LearnableEndpointGate()
+
+        self.displacement_head = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, input_dim),
+        )
 
         self.apply(weight_init)
         nn.init.zeros_(self.endpoint_delta_head[-1].weight)
@@ -432,23 +400,28 @@ class VAE(nn.Module):
 
         # Expand learnable time queries (shared across all decoder blocks)
         time_q = (self.time_queries_base + self.time_pe).expand(-1, N_a, -1)  # [T_f, N_a, hidden_dim]
+        endpoint_q = self.endpoint_query.expand(-1, N_a, -1) 
+        decoder_q = torch.cat([endpoint_q, time_q], dim=0)
 
         # 1. Stacked decoder blocks (Time SA → Time×Latent CA per block)
         for dec_block in self.decoder_blocks:
-            time_q = dec_block(time_q, z)
+            decoder_q = dec_block(decoder_q, z)
+
+        endpoint_feature = decoder_q[0]   # [N, H]
+        step_features = decoder_q[1:]
+        endpoint = self.endpoint_head(endpoint_feature)
 
         # 2. MLP → coordinates
-        raw_trajectory = self.decoder_mlp(time_q).transpose(0, 1)   # [N_a, T_f, 2]
+        raw_step_residual = self.displacement_head(step_features).transpose(0, 1)   # [N_a, T_f, 2]
+        zero_sum_residual = raw_step_residual - raw_step_residual.mean(dim=1, keepdim=True)
 
-        endpoint_feature = time_q[-1]
-        endpoint_delta = self.endpoint_delta_head(endpoint_feature) 
-        endpoint = raw_trajectory[:, -1, :] + endpoint_delta
-        s = torch.arange(1, self.num_future_steps + 1, device=raw_trajectory.device, dtype=raw_trajectory.dtype,) / float(self.num_future_steps)
-        gate = self.endpoint_gate(s).view(1, self.num_future_steps, 1)
-        corrected_trajectory = raw_trajectory + gate * endpoint_delta.unsqueeze(1)
-        corrected_trajectory = torch.cat([corrected_trajectory[:, :-1], endpoint.unsqueeze(1)], dim=1)
+        base_step = endpoint.unsqueeze(1) / float(self.num_future_steps)
+        displacements = base_step + zero_sum_residual
 
-        return corrected_trajectory
+        trajectory = torch.cumsum(displacements, dim=1)
+        trajectory = torch.cat([trajectory[:, :-1], endpoint.unsqueeze(1)], dim=1)
+
+        return trajectory
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Full VAE forward pass.
