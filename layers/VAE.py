@@ -324,8 +324,6 @@ class VAE(nn.Module):
         )
 
         self.apply(weight_init)
-        nn.init.zeros_(self.endpoint_delta_head[-1].weight)
-        nn.init.zeros_(self.endpoint_delta_head[-1].bias)
 
     def encode(self, x: torch.Tensor, predict_mask: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode future trajectories into latent distribution parameters.

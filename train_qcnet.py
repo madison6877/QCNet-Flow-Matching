@@ -32,7 +32,7 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 torch.set_float32_matmul_precision('high')
 
 if __name__ == '__main__':
-    pl.seed_everything(2027, workers=True)
+    pl.seed_everything(2024, workers=True)
 
     parser = ArgumentParser()
     parser.add_argument('--root', type=str, required=True)

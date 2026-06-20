@@ -201,7 +201,7 @@ class QCNetDiTBlock(nn.Module):
             x_mod = self.norm3(x_flat) * (1.0 + scale3_a) + shift3_a
             r_norm = self.a2a_attn.attn_prenorm_r(r_a2a_exp) if (self.a2a_attn.has_pos_emb and r_a2a_exp is not None) else None
             x_m_normed = self.norm3(x_m_flat) * (1.0 + scale3_a) + shift3_a
-            x_src = x_m_normed + alpha * self.a2a_dynamic_align(x_mod - x_m_normed)
+            x_src = (1 - alpha) * self.a2a_dynamic_align(x_m_normed)  + alpha * x_mod
             #x_src = self.a2a_attn.attn_prenorm_x_src(x_m_flat)
             attn_out = self.a2a_attn._attn_block(x_src=x_src, x_dst=x_mod, r=r_norm, edge_index=edge_index_a2a_exp, edge_gate=edge_threat_exp)
             x_flat = x_flat + gate3_a * attn_out
@@ -766,6 +766,8 @@ class QCNetFMDecoder(nn.Module):
         for _ in range(num_modes):
             # initial noise in latent space: x_0 ~ N(0, I)  → [N_a, K, H]
             x_t = torch.randn(N_a, self.num_intents, self.latent_dim, device=device)
+            scale = torch.tensor([0.9458926320075989, 0.6536939144134521, 1.17396879196167, 0.5958303809165955, 0.6562486886978149],device=device).reshape(1, 1, -1)
+            x_t = x_t * scale
             for t_val in t_grid:
                 t_cur_tensor.fill_(t_val)
                 t_next_tensor.fill_(t_val + dt)

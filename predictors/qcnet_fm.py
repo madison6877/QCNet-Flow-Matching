@@ -39,7 +39,6 @@ from modules import QCNetFMDecoder
 from modules import LatentSpaceEncoder
 from modules import LatentSpaceDecoder
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR, MultiStepLR
-from losses.vae_geometry_regularizer import FiniteDifferenceGeometryLoss
 
 try:
     from av2.datasets.motion_forecasting.eval.submission import ChallengeSubmission
@@ -231,8 +230,8 @@ class QCNetFM(pl.LightningModule):
 
         self.test_predictions = dict()
 
-        means = [0.0127,  0.0080,  -0.0431,  -0.0108,  0.0138]
-        stds  = [0.5870,  1.0910,   0.9122,  0.7358,  0.7219]
+        means =  [-0.011081701144576073, -0.010677292011678219, 0.01709645800292492, 0.0015562275657430291, -0.020165948197245598]
+        stds  =  [0.9458926320075989, 0.6536939144134521, 1.17396879196167, 0.5958303809165955, 0.6562486886978149]
         self.register_buffer('z_mean', torch.tensor(means, dtype=torch.float32).view(1, 1, -1))
         self.register_buffer('z_std', torch.tensor(stds, dtype=torch.float32).view(1, 1, -1))
 
@@ -244,7 +243,7 @@ class QCNetFM(pl.LightningModule):
                 self.mean = mean
                 self.std = std
             def forward(self, z, *args, **kwargs):
-                z_unnorm = z * self.std.to(z.device) + self.mean.to(z.device)
+                z_unnorm = z + self.mean.to(z.device)
                 return self.decoder(z_unnorm, *args, **kwargs)
         self.latent_decoder = UnnormDecoderWrapper(self.latent_decoder, self.z_mean, self.z_std)
 
@@ -285,7 +284,7 @@ class QCNetFM(pl.LightningModule):
         self.latent_encoder.eval()
 
         z_target_raw = self.latent_encoder.encode(target, predict_mask=predict_mask)
-        z_target_std = (z_target_raw - self.z_mean) / (self.z_std + 1e-6)
+        z_target_std = z_target_raw - self.z_mean
 
         return z_target_std
 
@@ -395,12 +394,13 @@ class QCNetFM(pl.LightningModule):
             z_target = self.latent_encoder.encode(target, predict_mask=predict_mask)  # [N_a, 3, H]
 
         #-----------------------------------------------------------------------
-        z_target = (z_target - self.z_mean) / (self.z_std + 1e-6)
+        z_target = z_target - self.z_mean
         #-----------------------------------------------------------------------
 
         agent_batch = data['agent'].get('batch', None)
         x_0, t = FlowMatchingLoss.sample_noise_and_time_latent(
             self.vae_num_intents, target.size(0), self.latent_dim, self.device, agent_batch)
+        x_0 = x_0 * self.z_std
         if self.current_epoch == 0 and batch_idx == 0:
             first_scene_mask = agent_batch == agent_batch[0]
             print("first scene t:")
@@ -688,11 +688,12 @@ class QCNetFM(pl.LightningModule):
             # Encode target to latent for validation loss computation
             z_target = self.latent_encoder.encode(target, predict_mask=predict_mask)  # [N_a, 3, H]
             #-----------------------------------------------------------------------
-            z_target = (z_target - self.z_mean) / (self.z_std + 1e-6)
+            z_target = z_target - self.z_mean
             #-----------------------------------------------------------------------
 
             x_0, t = FlowMatchingLoss.sample_noise_and_time_latent(
                 self.vae_num_intents, target.size(0), self.latent_dim, self.device, agent_batch)
+            x_0 = x_0 * self.z_std
             t_exp = t[:, None, None]
             x_t = (1 - t_exp) * x_0 + t_exp * z_target
             v_theta, pinn_loss = self(data, scene_enc, x_t, t)
