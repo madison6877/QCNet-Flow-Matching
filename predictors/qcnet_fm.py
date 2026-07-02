@@ -15,7 +15,7 @@ import gc
 from itertools import chain
 from itertools import compress
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 
 import pytorch_lightning as pl
 import torch
@@ -24,6 +24,8 @@ import torch.nn.functional as F
 from torch_geometric.data import Batch
 from torch_geometric.data import HeteroData
 from utils import weight_init
+
+from layers import AttentionLayer
 
 from losses import FlowMatchingLoss
 from losses import LatentFlowMatchingLoss
@@ -45,34 +47,96 @@ try:
 except ImportError:
     ChallengeSubmission = object
 
-class DeterministicLatentRegressor(nn.Module):
-
-    def __init__(self, hidden_dim: int, latent_dim: int, num_intents: int,) -> None:
+class DeterministicContextBlock(nn.Module):
+    def __init__(self,
+                 hidden_dim: int,
+                 num_heads: int,
+                 head_dim: int,
+                 dropout: float) -> None:
         super().__init__()
+        self.hidden_dim = hidden_dim
 
-        self.latent_dim = latent_dim
-        self.num_intents = num_intents
-
-        self.net = nn.Sequential(
-                nn.LayerNorm(hidden_dim),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, num_intents * latent_dim,)
-        )
+        self.t2a_attn = AttentionLayer(hidden_dim=hidden_dim, num_heads=num_heads, head_dim=head_dim, dropout=dropout, bipartite=True, has_pos_emb=True)
+        self.pl2a_attn = AttentionLayer(hidden_dim=hidden_dim, num_heads=num_heads, head_dim=head_dim, dropout=dropout, bipartite=True, has_pos_emb=True)
+        self.a2a_attn = AttentionLayer(hidden_dim=hidden_dim, num_heads=num_heads, head_dim=head_dim, dropout=dropout, bipartite=True, has_pos_emb=True)
 
         self.apply(weight_init)
 
-        # 初始输出为标准化 latent 0，也就是 latent 均值。
-        last_layer = self.net[-1]
-        nn.init.zeros_(last_layer.weight)
-        nn.init.zeros_(last_layer.bias)
+    def forward(self,
+                x: torch.Tensor,
+                x_t_hist: torch.Tensor,
+                x_pl: torch.Tensor,
+                x_a: torch.Tensor,
+                r_t2a_exp: Optional[torch.Tensor],
+                edge_index_t2a_exp: Optional[torch.Tensor],
+                r_pl2a_exp: Optional[torch.Tensor],
+                edge_index_pl2a_exp: Optional[torch.Tensor],
+                r_a2a_exp: Optional[torch.Tensor],
+                edge_index_a2a_exp: Optional[torch.Tensor],
+                edge_map_exp: Optional[torch.Tensor] = None,
+                edge_threat_exp: Optional[torch.Tensor] = None) -> torch.Tensor:
 
-    def forward(self, x_m: torch.Tensor) -> torch.Tensor:
-        n_agents = x_m.size(0)
-        z_pred = self.net(x_m)
-        return z_pred.view(n_agents,self.num_intents,self.latent_dim)
+        x = self.t2a_attn((x_t_hist, x), r_t2a_exp, edge_index_t2a_exp)
+        x = self.pl2a_attn((x_pl, x), r_pl2a_exp, edge_index_pl2a_exp, edge_gate=edge_map_exp)
+        x = self.a2a_attn((x_a, x), r_a2a_exp, edge_index_a2a_exp, edge_gate=edge_threat_exp)
+
+        return x
+
+class DeterministicLatentRegressor(nn.Module):
+
+    def __init__(self,
+                 hidden_dim: int,
+                 latent_dim: int,
+                 num_intents: int,
+                 num_heads: int,
+                 head_dim: int,
+                 dropout: float = 0.1,
+                 num_context_layers: int = 1) -> None:
+            
+        super().__init__()
+
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.num_intents = num_intents
+        self.num_context_layers = num_context_layers
+
+        self.query = nn.Parameter(0.1 * torch.randn(num_intents,hidden_dim))
+
+        self.context_blocks = nn.ModuleList([DeterministicContextBlock(hidden_dim=hidden_dim, num_heads=num_heads, head_dim=head_dim, dropout=dropout) 
+                                             for _ in range(num_context_layers)])
+        
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.to_latent = nn.Linear(hidden_dim, latent_dim)
+
+        self.apply(weight_init)
+        nn.init.normal_(self.to_latent.weight,mean=0.0,std=1e-3)
+        nn.init.zeros_(self.to_latent.bias)
+
+    def forward(self, x_m: torch.Tensor, context: Dict[str, torch.Tensor],) -> torch.Tensor:
+        num_agents = x_m.size(0)
+        x = self.query.unsqueeze(0).expand(num_agents,self.num_intents,self.hidden_dim).reshape(num_agents * self.num_intents, self.hidden_dim)
+        x_a = (x_m.unsqueeze(1).expand(-1,self.num_intents,-1).reshape(num_agents * self.num_intents,self.hidden_dim))
+        x_t_hist = context["x_t_hist"]
+        x_pl = context["x_pl"]
+
+        for block in self.context_blocks:
+            x = block(
+                x=x,
+                x_t_hist=x_t_hist,
+                x_pl=x_pl,
+                x_a=x_a,
+                r_t2a_exp=context["r_t2a_exp"],
+                edge_index_t2a_exp=context["edge_index_t2a_exp"],
+                r_pl2a_exp=context["r_pl2a_exp"],
+                edge_index_pl2a_exp=context["edge_index_pl2a_exp"],
+                r_a2a_exp=context["r_a2a_exp"],
+                edge_index_a2a_exp=context["edge_index_a2a_exp"],
+                edge_map_exp=context.get("edge_map_exp"),
+                edge_threat_exp=context.get("edge_threat_exp"))
+            
+        z_pred = self.to_latent(self.output_norm(x))
+
+        return z_pred.view(num_agents,self.num_intents,self.latent_dim)
 
 class QCNetFM(pl.LightningModule):
 
@@ -230,25 +294,49 @@ class QCNetFM(pl.LightningModule):
 
         self.test_predictions = dict()
 
-        means = [0.0127,  0.0080,  -0.0431,  -0.0108,  0.0138]
-        stds  = [0.5870,  1.0910,   0.9122,  0.7358,  0.7219]
-        self.register_buffer('z_mean', torch.tensor(means, dtype=torch.float32).view(1, 1, -1))
-        self.register_buffer('z_std', torch.tensor(stds, dtype=torch.float32).view(1, 1, -1))
+        means =  [0.0444621741771698, -0.019938623532652855, -0.008124598301947117, -0.042931146919727325, -0.006348638329654932]
+        stds =  [0.6535577178001404, 1.1441980600357056, 0.8359677791595459, 0.5522066950798035, 0.7899162769317627]
+        if len(means) != self.latent_dim or len(stds) != self.latent_dim:
+            raise ValueError(
+                "z_mean/z_std 的维数必须与 latent_dim 一致："
+                f"latent_dim={self.latent_dim}, len(mean)={len(means)}, len(std)={len(stds)}"
+            )
+        if any(s <= 0.0 for s in stds):
+            raise ValueError("z_std 的每一维都必须大于 0。")
 
-        # 包裹 VAE Decoder 自动反归一化
-        class UnnormDecoderWrapper(nn.Module):
-            def __init__(self, decoder, mean, std):
+        self.register_buffer(
+            'z_mean', torch.tensor(means, dtype=torch.float32).view(1, 1, -1)
+        )
+        self.register_buffer(
+            'z_std', torch.tensor(stds, dtype=torch.float32).view(1, 1, -1)
+        )
+
+        # FM 工作在 centered-raw latent：z_c = z_raw - mean。
+        # 解码时只加回 mean，不乘 std。
+        class CenteredRawDecoderWrapper(nn.Module):
+            def __init__(self, decoder, mean):
                 super().__init__()
                 self.decoder = decoder
                 self.mean = mean
-                self.std = std
+
             def forward(self, z, *args, **kwargs):
-                z_unnorm = z * self.std.to(z.device) + self.mean.to(z.device)
-                return self.decoder(z_unnorm, *args, **kwargs)
-        self.latent_decoder = UnnormDecoderWrapper(self.latent_decoder, self.z_mean, self.z_std)
+                mean = self.mean.to(device=z.device, dtype=z.dtype)
+                return self.decoder(z + mean, *args, **kwargs)
+
+        self.latent_decoder = CenteredRawDecoderWrapper(
+            self.latent_decoder, self.z_mean
+        )
 
         if self.latent_regression_only:
-            self.latent_regressor = DeterministicLatentRegressor(hidden_dim=self.hidden_dim,latent_dim=self.latent_dim,num_intents=self.vae_num_intents)
+            self.latent_regressor = DeterministicLatentRegressor(
+                hidden_dim=self.hidden_dim,
+                latent_dim=self.latent_dim,
+                num_intents=self.vae_num_intents,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                dropout=self.dropout,
+                num_context_layers=2
+            )
         else:
             self.latent_regressor = None
         if self.freeze_vae:
@@ -256,25 +344,41 @@ class QCNetFM(pl.LightningModule):
                 param.requires_grad_(False)
             for param in self.latent_decoder.parameters():
                 param.requires_grad_(False)
+        for module_name, module in self.encoder.named_modules():
+            if isinstance(module, AttentionLayer):
+                module.debug_name = module_name
             
     def _training_step_latent_regression_cached(self, batch, batch_idx):
         
         # Lightning 会自动把字典中的 tensor 搬到 GPU
         x_m = batch["x_m"]
-        z_target_std = batch["z_target_std"]
+        context = {"x_t_hist": batch["x_t_hist"],
+                  "x_pl": batch["x_pl"],
+                  "r_t2a_exp": batch["r_t2a_exp"],
+                  "edge_index_t2a_exp": batch["edge_index_t2a_exp"],
+                  "r_pl2a_exp": batch["r_pl2a_exp"],
+                  "edge_index_pl2a_exp": batch["edge_index_pl2a_exp"],
+                  "r_a2a_exp": batch["r_a2a_exp"],
+                  "edge_index_a2a_exp": batch["edge_index_a2a_exp"],
+                  "edge_map_exp": batch.get("edge_map_exp"),
+                  "edge_threat_exp": batch.get("edge_threat_exp")}
 
-        z_pred_std = self.latent_regressor(x_m)
-        error = z_pred_std - z_target_std
+        z_target = batch["z_target_centered_raw"]
+        valid_mask = batch["valid_agent_mask"].bool()
 
-        # 与当前 FM loss 类似：K 和 latent dim 求和，agent 求平均
-        per_agent_loss = error.pow(2).sum(dim=(-1, -2))
-        loss = per_agent_loss.mean()
+        z_pred = self.latent_regressor(x_m=x_m, context=context)
 
-        latent_mse = error.pow(2).mean()
-        latent_rmse = latent_mse.clamp_min(1e-12).sqrt()
+        if not valid_mask.any():
+            return z_pred.sum() * 0.0
 
-        self.log("train_latent_reg_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=x_m.size(0))
-        self.log("train_latent_reg_rmse", latent_rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=x_m.size(0))
+        error = z_pred[valid_mask] - z_target[valid_mask]
+
+        loss = error.pow(2).sum(dim=(-1, -2)).mean()
+        latent_rmse = error.pow(2).mean().clamp_min(1e-12).sqrt()
+        num_valid = int(valid_mask.sum().item())
+
+        self.log("train_latent_reg_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_valid, 1))
+        self.log("train_latent_reg_rmse", latent_rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_valid, 1))
 
         return loss
 
@@ -284,9 +388,9 @@ class QCNetFM(pl.LightningModule):
         self.latent_encoder.eval()
 
         z_target_raw = self.latent_encoder.encode(target, predict_mask=predict_mask)
-        z_target_std = (z_target_raw - self.z_mean) / (self.z_std + 1e-6)
+        z_target_centered_raw = z_target_raw - self.z_mean
 
-        return z_target_std
+        return z_target_centered_raw
 
 
     def forward(self, data: HeteroData, scene_enc: dict, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -320,8 +424,31 @@ class QCNetFM(pl.LightningModule):
         return float(beta_now)
     
     
-    def _decoder_aware_trajectory_loss(self, v_theta: torch.Tensor, x_0: torch.Tensor, target: torch.Tensor, 
-                                       predict_mask: torch.Tensor, category: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+    def _decoder_aware_trajectory_loss(
+            self,
+            v_theta: torch.Tensor,
+            x_t: torch.Tensor,
+            t: torch.Tensor,
+            z_target: torch.Tensor,
+            predict_mask: torch.Tensor,
+            category: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Time-aware decoder center-consistency loss.
+
+        For the linear conditional path
+
+            x_t = (1 - t) x_0 + t z_1,
+
+        the local terminal extrapolation is
+
+            z_hat_1|t = x_t + (1 - t) v_theta(x_t, t, c).
+
+        Both z_hat_1|t and z_target are decoded by the same frozen VAE decoder.
+        The predicted trajectory is compared only with the VAE center
+        reconstruction D(z_target), never with the raw ground-truth trajectory.
+        Therefore this auxiliary objective and the latent FM objective share the
+        same optimum z_hat_1|t = z_target.
+        """
         future_valid_mask = predict_mask.any(dim=-1)
 
         if self.decoder_aux_focal_only:
@@ -333,37 +460,52 @@ class QCNetFM(pl.LightningModule):
 
         if num_aux_agents == 0:
             zero = v_theta.sum() * 0.0
-            return zero, zero, 0
+            return zero, zero, zero.detach(), 0
 
-        # 对线性 FM：target velocity = z_target - x_0，所以 x_0 + v_theta 是预测的 endpoint latent。
-        z_pred_std = x_0[aux_agent_mask] + v_theta[aux_agent_mask]
+        remaining_time = (1.0 - t[aux_agent_mask]).view(-1, 1, 1)
+        z_pred_terminal = (
+            x_t[aux_agent_mask]
+            + remaining_time * v_theta[aux_agent_mask]
+        )
+        z_target_aux = z_target[aux_agent_mask]
 
-        # decoder 必须为 eval，但不能使用 no_grad，需要让梯度从轨迹误差穿过 decoder 返回 v_theta。
+        # Decoder参数可冻结，但预测分支不能放在 no_grad 中，
+        # 否则轨迹误差无法传回速度场。
         self.latent_decoder.eval()
-        traj_pred = self.latent_decoder(z_pred_std)
+        traj_pred = self.latent_decoder(z_pred_terminal)
 
-        target_aux = target[aux_agent_mask]
+        # 目标分支固定为 VAE 中心重构。目标 decoder 不需要梯度，
+        # 预测分支仍保留对 z_pred_terminal 和速度场的梯度。
+        with torch.no_grad():
+            target_aux = self.latent_decoder(z_target_aux)
+
         mask_aux = predict_mask[aux_agent_mask].bool()
 
-        # decoder 输出和 target 都处于 /10 的归一化空间。转换成米后计算与正式指标同口径的距离。
-        error_m = (traj_pred[..., :self.output_dim] - target_aux[..., :self.output_dim]) * self.trajectory_scale
-        distance_m = torch.sqrt(error_m.pow(2).sum(dim=-1) + 1e-8)  # [N_aux, T_future]
+        error_m = (
+            traj_pred[..., :self.output_dim]
+            - target_aux[..., :self.output_dim]
+        ) * self.trajectory_scale
+        distance_m = torch.sqrt(error_m.pow(2).sum(dim=-1) + 1e-8)
 
         mask_float = mask_aux.to(distance_m.dtype)
         valid_steps = mask_float.sum(dim=-1).clamp_min(1.0)
 
-        # 每个 agent 先对有效时间点平均，再对 agent 平均。
         ade_per_agent = (distance_m * mask_float).sum(dim=-1) / valid_steps
         ade_loss_m = ade_per_agent.mean()
 
-        # 每个 agent 的最后一个有效未来点。
-        time_index = torch.arange(mask_aux.size(1), device=mask_aux.device).view(1, -1)
+        time_index = torch.arange(
+            mask_aux.size(1), device=mask_aux.device
+        ).view(1, -1)
         last_valid_index = time_index.masked_fill(~mask_aux, -1).max(dim=-1).values
         agent_index = torch.arange(num_aux_agents, device=mask_aux.device)
         fde_per_agent = distance_m[agent_index, last_valid_index]
         fde_loss_m = fde_per_agent.mean()
 
-        return ade_loss_m, fde_loss_m, num_aux_agents
+        latent_terminal_rmse = (
+            z_pred_terminal.detach() - z_target_aux.detach()
+        ).pow(2).mean().clamp_min(1e-12).sqrt()
+
+        return ade_loss_m, fde_loss_m, latent_terminal_rmse, num_aux_agents
 
 
     def training_step(self, data, batch_idx):
@@ -388,32 +530,33 @@ class QCNetFM(pl.LightningModule):
         target = target / 10.0
         predict_mask = data['agent']['predict_mask'][:, self.num_historical_steps:]
 
-        # Encode ground-truth trajectory into 3 latent intent vectors [N_a, 3, H]
+        # Encode ground-truth trajectory into latent intent vectors [N_a, num_intents, latent_dim]
         self.latent_encoder.eval()
         with torch.no_grad():
-            z_target = self.latent_encoder.encode(target, predict_mask=predict_mask)  # [N_a, 3, H]
+            z_target = self.latent_encoder.encode(target, predict_mask=predict_mask)  # [N_a, num_intents, latent_dim]
 
         #-----------------------------------------------------------------------
-        z_target = (z_target - self.z_mean) / (self.z_std + 1e-6)
+        z_target = z_target - self.z_mean
         #-----------------------------------------------------------------------
 
         agent_batch = data['agent'].get('batch', None)
         x_0, t = FlowMatchingLoss.sample_noise_and_time_latent(
             self.vae_num_intents, target.size(0), self.latent_dim, self.device, agent_batch)
+        x_0 = x_0 * self.z_std.to(device=x_0.device, dtype=x_0.dtype)
         if self.current_epoch == 0 and batch_idx == 0:
             first_scene_mask = agent_batch == agent_batch[0]
             print("first scene t:")
             print(t[first_scene_mask][:20].detach().cpu())
             print("unique t in first scene:")
             print(torch.unique(t[first_scene_mask]).numel())
-        # x_0: [N_a, 3, H], t: [N_a]
+        # x_0: [N_a, num_intents, latent_dim], t: [N_a]
 
         # Linear interpolation in latent space: x_t = t * z_target + (1 - t) * x_0
         t_exp = t[:, None, None]
         x_t = (1 - t_exp) * x_0 + t_exp * z_target
 
         scene_enc = self.encoder(data)
-        v_theta, pinn_loss = self(data, scene_enc, x_t, t)  # [N_a, 3, H]
+        v_theta, pinn_loss = self(data, scene_enc, x_t, t)  # [N_a, num_intents, latent_dim]
 
         # 🌟 修复 1：过滤掉 99% 不需要预测的背景车辆的垃圾梯度
         valid_mask = predict_mask.any(dim=-1)
@@ -428,16 +571,25 @@ class QCNetFM(pl.LightningModule):
         fm_loss, loss_dict = self.latent_fm_loss(v_theta_valid, z_target_valid, x_0_valid)
         fm_loss = fm_loss + 1000.0 * pinn_loss
 
-        aux_ade_m, aux_fde_m, num_aux_agents = self._decoder_aware_trajectory_loss(v_theta=v_theta, x_0=x_0, target=target, 
-                                                                                   predict_mask=predict_mask, category=data["agent"]["category"])
+        aux_ade_m, aux_fde_m, aux_latent_rmse, num_aux_agents = (
+            self._decoder_aware_trajectory_loss(
+                v_theta=v_theta,
+                x_t=x_t,
+                t=t,
+                z_target=z_target,
+                predict_mask=predict_mask,
+                category=data["agent"]["category"],
+            )
+        )
         aux_scale = self._get_decoder_aux_scale()
         weighted_aux_ade = aux_scale * self.decoder_aux_ade_weight * aux_ade_m
         weighted_aux_fde = aux_scale * self.decoder_aux_fde_weight * aux_fde_m
         loss = fm_loss + weighted_aux_ade + weighted_aux_fde
         
         self.log('train_fm_loss', fm_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
-        self.log("train_decoder_aux_ADE_m", aux_ade_m, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1))
-        self.log("train_decoder_aux_FDE_m", aux_fde_m, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1))
+        self.log("train_decoder_center_ADE_m", aux_ade_m, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1))
+        self.log("train_decoder_center_FDE_m", aux_fde_m, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1))
+        self.log("train_decoder_terminal_latent_RMSE", aux_latent_rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1))
         self.log("train_decoder_aux_weighted", weighted_aux_ade + weighted_aux_fde, prog_bar=False, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1))
         self.log("train_decoder_aux_scale", torch.tensor(aux_scale, device=self.device), prog_bar=False, on_step=False, on_epoch=True, batch_size=1)
         self.log("train_total_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=int(valid_mask.sum()))
@@ -493,6 +645,7 @@ class QCNetFM(pl.LightningModule):
             trajectories, _ = self.fm_decoder.sample(
                 data, scene_enc, num_modes=self.num_modes, num_steps=self.fm_num_steps,
                 latent_decoder=self.latent_decoder,
+                latent_std=self.z_std,
             )
         
         self.train()
@@ -513,18 +666,21 @@ class QCNetFM(pl.LightningModule):
             return torch.zeros((), device=self.device, requires_grad=True)
 
         self.encoder.eval()
+        self.fm_decoder.eval()
         self.latent_encoder.eval()
         self.latent_decoder.eval()
 
         with torch.no_grad():
             scene_enc = self.encoder(data)
-            z_target_std = self._get_standardized_latent_target(target=target,predict_mask=predict_mask)
+            context = self.fm_decoder._build_graph_context(data=data, scene_enc=scene_enc)
+            z_target_centered_raw = self._get_standardized_latent_target(target=target, predict_mask=predict_mask)
 
         x_m = scene_enc["x_a"][:, -1, :]
 
-        z_pred_std = self.latent_regressor(x_m)
-        z_pred_valid = z_pred_std[valid_agent_mask]
-        z_target_valid = z_target_std[valid_agent_mask]
+        z_pred_centered_raw = self.latent_regressor(x_m=x_m, context=context)
+
+        z_pred_valid = z_pred_centered_raw[valid_agent_mask]
+        z_target_valid = z_target_centered_raw[valid_agent_mask]
 
         per_agent_se = (z_pred_valid - z_target_valid).pow(2).sum(dim=(-1, -2))
         latent_reg_loss = per_agent_se.mean()
@@ -555,15 +711,16 @@ class QCNetFM(pl.LightningModule):
 
         # Encode scene and get standardized latent target
         scene_enc = self.encoder(data)
-        z_target_std = self._get_standardized_latent_target(target=target, predict_mask=predict_mask)
+        context = self.fm_decoder._build_graph_context(data=data, scene_enc=scene_enc)
+        z_target_centered_raw = self._get_standardized_latent_target(target=target, predict_mask=predict_mask)
 
         # Predict latent representation
         x_m = scene_enc["x_a"][:, -1, :]
-        z_pred_std = self.latent_regressor(x_m)
+        z_pred_centered_raw = self.latent_regressor(x_m, context=context)
 
         # Filter valid agents
-        z_pred_valid = z_pred_std[valid_agent_mask]
-        z_target_valid = z_target_std[valid_agent_mask]
+        z_pred_valid = z_pred_centered_raw[valid_agent_mask]
+        z_target_valid = z_target_centered_raw[valid_agent_mask]
 
         # Compute latent regression loss and metrics
         per_agent_se = (z_pred_valid - z_target_valid).pow(2).sum(dim=(-1, -2))
@@ -577,7 +734,7 @@ class QCNetFM(pl.LightningModule):
         self.log("val_latent_reg_rmse", latent_rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
 
         # Decode trajectories from predicted latent (wrapper handles inverse standardization)
-        traj_pred = self.latent_decoder(z_pred_std)  # Shape: [N_a, T_f, 2], scale: /10
+        traj_pred = self.latent_decoder(z_pred_centered_raw)  # Shape: [N_a, T_f, 2], scale: /10
 
         # Determine evaluation mask based on dataset
         if self.dataset == "argoverse_v2":
@@ -610,13 +767,13 @@ class QCNetFM(pl.LightningModule):
     def _validation_step_latent_regression_cached(self, batch, batch_idx):
         """Validation step for latent regression using cached data."""
         x_m = batch["x_m"]
-        z_target_std = batch["z_target_std"]
+        z_target_centered_raw = batch["z_target_std"]
         target = batch["target"]
         predict_mask = batch["predict_mask"].bool()
         eval_mask = batch["eval_mask"].bool()
 
-        z_pred_std = self.latent_regressor(x_m)
-        error = z_pred_std - z_target_std
+        z_pred_centered_raw = self.latent_regressor(x_m)
+        error = z_pred_centered_raw - z_target_centered_raw
 
         latent_loss = error.pow(2).sum(dim=(-1, -2)).mean()
         latent_rmse = error.pow(2).mean().clamp_min(1e-12).sqrt()
@@ -625,7 +782,7 @@ class QCNetFM(pl.LightningModule):
         self.log("val_latent_reg_rmse", latent_rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=x_m.size(0), sync_dist=True)
 
         # latent_decoder 接收标准化 latent，wrapper 内部会自动反标准化
-        trajectory = self.latent_decoder(z_pred_std)
+        trajectory = self.latent_decoder(z_pred_centered_raw)
 
         if not eval_mask.any():
             return
@@ -685,13 +842,14 @@ class QCNetFM(pl.LightningModule):
             scene_enc = self.encoder(data)
 
             # Encode target to latent for validation loss computation
-            z_target = self.latent_encoder.encode(target, predict_mask=predict_mask)  # [N_a, 3, H]
+            z_target = self.latent_encoder.encode(target, predict_mask=predict_mask)  # [N_a, num_intents, latent_dim]
             #-----------------------------------------------------------------------
-            z_target = (z_target - self.z_mean) / (self.z_std + 1e-6)
+            z_target = z_target - self.z_mean
             #-----------------------------------------------------------------------
 
             x_0, t = FlowMatchingLoss.sample_noise_and_time_latent(
                 self.vae_num_intents, target.size(0), self.latent_dim, self.device, agent_batch)
+            x_0 = x_0 * self.z_std.to(device=x_0.device, dtype=x_0.dtype)
             t_exp = t[:, None, None]
             x_t = (1 - t_exp) * x_0 + t_exp * z_target
             v_theta, pinn_loss = self(data, scene_enc, x_t, t)
@@ -709,12 +867,21 @@ class QCNetFM(pl.LightningModule):
         fm_loss, loss_dict = self.latent_fm_loss(v_theta_valid, z_target_valid, x_0_valid)
         fm_loss = fm_loss + 1000.0 * pinn_loss
 
-        aux_ade_m, aux_fde_m, num_aux_agents = self._decoder_aware_trajectory_loss(v_theta=v_theta,x_0=x_0,target=target,
-                                                                                   predict_mask=predict_mask,category=data["agent"]["category"])
+        aux_ade_m, aux_fde_m, aux_latent_rmse, num_aux_agents = (
+            self._decoder_aware_trajectory_loss(
+                v_theta=v_theta,
+                x_t=x_t,
+                t=t,
+                z_target=z_target,
+                predict_mask=predict_mask,
+                category=data["agent"]["category"],
+            )
+        )
         
         self.log('val_fm_loss', fm_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
-        self.log("val_decoder_aux_ADE_m", aux_ade_m, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1), sync_dist=True,)
-        self.log("val_decoder_aux_FDE_m", aux_fde_m, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1), sync_dist=True)
+        self.log("val_decoder_center_ADE_m", aux_ade_m, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1), sync_dist=True,)
+        self.log("val_decoder_center_FDE_m", aux_fde_m, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1), sync_dist=True)
+        self.log("val_decoder_terminal_latent_RMSE", aux_latent_rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1), sync_dist=True)
         #self.log('val_pinn_loss', pinn_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
         # for k_name, v_loss in loss_dict.items():
         #     self.log(f'val_{k_name}', v_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
@@ -726,7 +893,7 @@ class QCNetFM(pl.LightningModule):
 
         # Stage 2: additionally evaluate scorer loss and trajectory prediction metrics
         if self.dataset == 'argoverse_v2':
-            eval_mask = data['agent']['category'] == 3
+            eval_mask = (data['agent']['category'] == 3) & predict_mask.any(dim=-1)
         else:
             raise ValueError('{} is not a valid dataset'.format(self.dataset))
 
@@ -735,6 +902,7 @@ class QCNetFM(pl.LightningModule):
                 traj_samples, pi = self.fm_decoder.sample(
                     data, scene_enc, num_modes=self.num_modes, num_steps=self.fm_num_steps,
                     latent_decoder=self.latent_decoder,
+                    latent_std=self.z_std,
                 )
                 # traj_samples: [N_a, num_modes, T_f, D], pi: [N_a, num_modes]
 
@@ -771,6 +939,11 @@ class QCNetFM(pl.LightningModule):
             self.log('val_MR', self.MR, prog_bar=True, on_step=False, on_epoch=True,
                      batch_size=gt_eval.size(0))
             
+    def on_validation_epoch_start(self):
+        self.minADE.reset()
+        self.minFDE.reset()
+        self.MR.reset()
+
     def on_train_epoch_end(self):
         gc.collect()
         torch.cuda.empty_cache()
@@ -787,6 +960,7 @@ class QCNetFM(pl.LightningModule):
         traj_samples, pi = self.fm_decoder.sample(
             data, scene_enc, num_modes=self.num_modes, num_steps=self.fm_num_steps,
             latent_decoder=self.latent_decoder,
+            latent_std=self.z_std,
         )
         # traj_samples: [N_a, num_modes, T_f, D], pi: [N_a, num_modes]
         traj_samples = traj_samples * 10.0
@@ -917,7 +1091,7 @@ class QCNetFM(pl.LightningModule):
         if warmup_epochs > 0:
             warmup_scheduler = LinearLR(
                 optimizer, 
-                start_factor=0.3, 
+                start_factor=0.4, 
                 total_iters=warmup_epochs
             )
             cosine_scheduler = CosineAnnealingLR(
@@ -981,12 +1155,21 @@ class QCNetFM(pl.LightningModule):
         parser.add_argument('--T_max', type=int, default=64)
         parser.add_argument('--submission_dir', type=str, default='./')
         parser.add_argument('--submission_file_name', type=str, default='submission')
-        parser.add_argument("--decoder_aux_ade_weight", type=float, default=0.08)
-        parser.add_argument("--decoder_aux_fde_weight", type=float, default=0.04)
+        parser.add_argument("--decoder_aux_ade_weight", type=float, default=0.07)
+        parser.add_argument("--decoder_aux_fde_weight", type=float, default=0.0)
         parser.add_argument("--decoder_aux_warmup_epochs", type=int, default=5)
-        parser.add_argument("--decoder_aux_focal_only", action="store_true", default=False)
+        parser.add_argument(
+            "--decoder_aux_focal_only",
+            action="store_true",
+            dest="decoder_aux_focal_only",
+            help="辅助轨迹损失仅作用于 category==3 且未来有效的 focal agent。",
+        )
+        parser.add_argument(
+            "--decoder_aux_all_valid",
+            action="store_false",
+            dest="decoder_aux_focal_only",
+            help="辅助轨迹损失作用于所有未来有效 agent。",
+        )
+        parser.set_defaults(decoder_aux_focal_only=True)
         parser.add_argument("--trajectory_scale", type=float, default=10.0)
         return parent_parser
-
-
-

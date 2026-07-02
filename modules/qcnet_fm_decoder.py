@@ -83,12 +83,12 @@ class QCNetDiTBlock(nn.Module):
         self.adaLN_t2a = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
         self.adaLN_pl2a = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
         self.adaLN_a2a = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
-        self.adaLN_seg = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
+        #self.adaLN_seg = nn.Sequential(nn.SiLU(), nn.Linear(hidden_dim, hidden_dim * 6))
 
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.norm3 = nn.LayerNorm(hidden_dim)
-        self.norm4 = nn.LayerNorm(hidden_dim)
+        #self.norm4 = nn.LayerNorm(hidden_dim)
 
         self.t2a_attn = AttentionLayer(hidden_dim=hidden_dim, num_heads=num_heads, head_dim=head_dim,
                                        dropout=dropout, bipartite=True, has_pos_emb=True)
@@ -96,14 +96,15 @@ class QCNetDiTBlock(nn.Module):
                                         dropout=dropout, bipartite=True, has_pos_emb=True)
         self.a2a_attn = AttentionLayer(hidden_dim=hidden_dim, num_heads=num_heads, head_dim=head_dim,
                                        dropout=dropout, bipartite=False, has_pos_emb=True)
-        self.seg_attn = TransformerLayer(hidden_dim=hidden_dim, num_heads=num_heads, dropout=dropout)
+        #self.seg_attn = TransformerLayer(hidden_dim=hidden_dim, num_heads=num_heads, dropout=dropout)
         #self.alpha_bias=nn.Parameter(torch.tensor(0.3))
         #self.alpha_scale=nn.Parameter(torch.tensor(10.0))
 
         self.apply(weight_init)
 
     def _init_adaln(self):
-        for ada_layer in [self.adaLN_t2a, self.adaLN_pl2a, self.adaLN_a2a, self.adaLN_seg]:
+        #for ada_layer in [self.adaLN_t2a, self.adaLN_pl2a, self.adaLN_a2a, self.adaLN_seg]:
+        for ada_layer in [self.adaLN_t2a, self.adaLN_pl2a, self.adaLN_a2a]:
             nn.init.zeros_(ada_layer[-1].weight)
             nn.init.zeros_(ada_layer[-1].bias)
 
@@ -160,14 +161,14 @@ class QCNetDiTBlock(nn.Module):
         
         #alpha=torch.sigmoid(scale * (t_scalar_exp - bias))
 
-        freq_emb_flat = freq_pos_emb.unsqueeze(0).expand(N_a, K, self.hidden_dim).reshape(N_a * K, self.hidden_dim)
+        #freq_emb_flat = freq_pos_emb.unsqueeze(0).expand(N_a, K, self.hidden_dim).reshape(N_a * K, self.hidden_dim)
         x_m_flat = x_m.unsqueeze(1).expand(-1, K, -1).reshape(N_a * K, self.hidden_dim)
         
         cond1 = t_emb_flat
         if use_xm:
             cond1 = cond1 + x_m_flat
-        if K > 1:
-            cond2 = cond1 + freq_emb_flat
+        # if K > 1:
+        #     cond2 = cond1 + freq_emb_flat
 
         if use_history:
             ssg_t2a = self.adaLN_t2a(cond1).chunk(6, dim=-1)
@@ -210,17 +211,17 @@ class QCNetDiTBlock(nn.Module):
             ff_out = self.a2a_attn._ff_block(ff_in)
             x_flat = x_flat + gate3_f * ff_out
 
-        if K > 1:
-            ssg_ffn = self.adaLN_seg(cond2).chunk(6, dim=-1)
-            shift4_a, scale4_a, gate4_a = ssg_ffn[0], ssg_ffn[1], ssg_ffn[2]
-            shift4_f, scale4_f, gate4_f = ssg_ffn[3], ssg_ffn[4], ssg_ffn[5]
-            x_mod = self.norm4(x_flat) * (1.0 + scale4_a) + shift4_a
-            x_mod_seg = x_mod.reshape(N_a, K, self.hidden_dim)
-            attn_out, _ = self.seg_attn.attn(query=x_mod_seg, key=x_mod_seg, value=x_mod_seg, need_weights=False)
-            x_flat = x_flat + gate4_a * attn_out.reshape(N_a * K, self.hidden_dim)
-            ff_in = self.seg_attn.ffn_prenorm(x_flat) * (1.0 + scale4_f) + shift4_f
-            ff_out = self.seg_attn.ffn(ff_in)
-            x_flat = x_flat + gate4_f * ff_out
+        # if K > 1:
+        #     ssg_ffn = self.adaLN_seg(cond2).chunk(6, dim=-1)
+        #     shift4_a, scale4_a, gate4_a = ssg_ffn[0], ssg_ffn[1], ssg_ffn[2]
+        #     shift4_f, scale4_f, gate4_f = ssg_ffn[3], ssg_ffn[4], ssg_ffn[5]
+        #     x_mod = self.norm4(x_flat) * (1.0 + scale4_a) + shift4_a
+        #     x_mod_seg = x_mod.reshape(N_a, K, self.hidden_dim)
+        #     attn_out, _ = self.seg_attn.attn(query=x_mod_seg, key=x_mod_seg, value=x_mod_seg, need_weights=False)
+        #     x_flat = x_flat + gate4_a * attn_out.reshape(N_a * K, self.hidden_dim)
+        #     ff_in = self.seg_attn.ffn_prenorm(x_flat) * (1.0 + scale4_f) + shift4_f
+        #     ff_out = self.seg_attn.ffn(ff_in)
+        #     x_flat = x_flat + gate4_f * ff_out
 
         return x_flat.reshape(N_a, K, self.hidden_dim)
 
@@ -229,36 +230,16 @@ class AsymmetricVelocityHead(nn.Module):
         super(AsymmetricVelocityHead, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_intents = num_intents
+        self.final_norm = nn.LayerNorm(hidden_dim)
         self.shortcut = nn.Linear(hidden_dim, output_dim)
-        self.time_proj = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim * 2)
-        )
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.residual = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, output_dim)
-        )
         self.apply(weight_init)
 
     def _init_weights(self):
-        nn.init.zeros_(self.residual[-1].weight)
-        nn.init.zeros_(self.residual[-1].bias)
         nn.init.zeros_(self.shortcut.weight)
         nn.init.zeros_(self.shortcut.bias)
-        nn.init.zeros_(self.time_proj[-1].weight)
-        nn.init.zeros_(self.time_proj[-1].bias)
 
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor, x_m: torch.Tensor) -> torch.Tensor:
-        N_a, K, _ = x.shape
-        x_m_exp = x_m.unsqueeze(1).expand(-1, K, -1)
-        t_cond = self.time_proj(t_emb+x_m_exp)        # [N_a, K, hidden_dim * 2]
-        shift, scale = t_cond.chunk(2, dim=-1)  # [N_a, K, hidden_dim]
-        x_modulated = self.norm(x) * (1.0 + scale) + shift
-        base_vel = self.shortcut(x) 
-        res_vel = self.residual(x_modulated)
-        return base_vel + res_vel
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.shortcut(x) 
 
 class QCNetFMDecoder(nn.Module):
     def __init__(self,
@@ -680,7 +661,7 @@ class QCNetFMDecoder(nn.Module):
         # ---- Step 2: DiT blocks (K frequency tokens in parallel) ----
         for layer_idx, block in enumerate(self.blocks):
             if layer_idx == 0:
-                use_xm = False
+                use_xm = True
                 use_history = True
                 use_map = True
                 use_agent = False
@@ -692,8 +673,8 @@ class QCNetFMDecoder(nn.Module):
 
             elif layer_idx == 2:
                 use_xm = True
-                use_history = False
-                use_map = False
+                use_history = True
+                use_map = True
                 use_agent = True
 
             x = block(
@@ -715,7 +696,7 @@ class QCNetFMDecoder(nn.Module):
             )
 
         # ---- Step 3: Asymmetric velocity output (K separate heads) ----
-        v_theta = self.to_vel(x, t_emb_s,x_m)  
+        v_theta = self.to_vel(x)  
 
         return v_theta
 
@@ -735,7 +716,8 @@ class QCNetFMDecoder(nn.Module):
                scene_enc: Mapping[str, torch.Tensor],
                num_modes: int = 6,
                num_steps: int = 10,
-               latent_decoder: Optional[nn.Module] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+               latent_decoder: Optional[nn.Module] = None,
+               latent_std: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """Sample trajectories via latent flow matching, optionally decode to physical space.
 
         Args:
@@ -761,10 +743,23 @@ class QCNetFMDecoder(nn.Module):
         all_outputs: List[torch.Tensor] = []
         t_cur_tensor = torch.empty(N_a, device=device)
         t_next_tensor = torch.empty(N_a, device=device)
+        if latent_std is None:
+            raise ValueError(
+                "centered-raw FM 采样必须显式传入 latent_std，"
+                "以保证训练与推理使用相同的先验尺度。"
+            )
+        latent_std = latent_std.to(device=device, dtype=ctx['pos_m'].dtype)
+        if latent_std.shape[-1] != self.latent_dim:
+            raise ValueError(
+                "latent_std 最后一维必须等于 latent_dim："
+                f"std_shape={tuple(latent_std.shape)}, latent_dim={self.latent_dim}"
+            )
+
 
         for _ in range(num_modes):
             # initial noise in latent space: x_0 ~ N(0, I)  → [N_a, K, H]
             x_t = torch.randn(N_a, self.num_intents, self.latent_dim, device=device)
+            x_t = x_t = x_t * latent_std.to(dtype=x_t.dtype)
             for t_val in t_grid:
                 t_cur_tensor.fill_(t_val)
                 t_next_tensor.fill_(t_val + dt)
@@ -789,12 +784,14 @@ class QCNetFMDecoder(nn.Module):
         trajectories = torch.stack(all_outputs, dim=1)  # [N_a, num_modes, ...]
 
         # Score requires physical trajectories; skip scoring if in latent space
-        if latent_decoder is not None:
-            agent_context = scene_enc['x_a'][:, -1, :]
-            logits = self.scorer(agent_context, trajectories)
-            pi = F.softmax(logits, dim=-1)
-        else:
-            pi = torch.ones(N_a, num_modes, device=device) / num_modes
+        # if latent_decoder is not None:
+        #     agent_context = scene_enc['x_a'][:, -1, :]
+        #     logits = self.scorer(agent_context, trajectories)
+        #     pi = F.softmax(logits, dim=-1)
+        # else:
+        #     pi = torch.ones(N_a, num_modes, device=device) / num_modes
+        
+        pi = torch.ones(N_a, num_modes, device=device) / num_modes
 
         return trajectories, pi
 

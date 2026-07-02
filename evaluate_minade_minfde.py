@@ -152,6 +152,22 @@ def load_model(
     if not allow_shape_mismatch:
         # 正式评估必须严格加载，防止漏载 velocity head 等关键模块。
         model.load_state_dict(state_dict, strict=True)
+        print("\n========== Latent normalization check ==========")
+
+        for key in ["z_mean", "z_std"]:
+            if key in state_dict:
+                print(f"checkpoint {key}:")
+                print(state_dict[key].detach().cpu().flatten())
+            else:
+                print(f"checkpoint 中不存在 {key}")
+
+        print("model z_mean after loading:")
+        print(model.z_mean.detach().cpu().flatten())
+
+        print("model z_std after loading:")
+        print(model.z_std.detach().cpu().flatten())
+
+        print("================================================\n")
     else:
         current = model.state_dict()
         compatible: Dict[str, torch.Tensor] = {}
@@ -191,7 +207,6 @@ def load_model(
             "[警告] 跳过关键输出头权重会使指标无效；"
             "该模式只适合定位兼容性问题。\n"
         )
-
     model.to(device)
     model.eval()
     for param in model.parameters():
@@ -312,6 +327,7 @@ def sample_trajectories_and_latents(
             decoder.latent_dim,
             device=device,
         )
+        x_t = x_t * model.z_std.float()
 
         for t_value in t_grid:
             t_cur.fill_(t_value)
@@ -616,7 +632,7 @@ def evaluate_once(
 
         latent_target_std = (
             latent_target_raw.float() - model.z_mean.float()
-        ) / (model.z_std.float() + 1e-6)
+        )
 
         trajectories_m = trajectories_normalized.float() * 10.0
         target_m = target_normalized.float() * 10.0
@@ -871,7 +887,7 @@ def main() -> None:
     model, hparams, _ = load_model(
         ckpt_path=ckpt_path,
         device=device,
-        allow_shape_mismatch=args.allow_shape_mismatch,
+        allow_shape_mismatch=False#args.allow_shape_mismatch,
     )
 
     datamodule = build_datamodule(hparams, args)
