@@ -13,8 +13,58 @@ from latent_regression_cache import make_latent_regression_loader
 torch.multiprocessing.set_sharing_strategy("file_system")
 torch.set_float32_matmul_precision("high")
 
+def load_vae_weights(model, ckpt_path):
+    print(f"🚀 从 {ckpt_path} 仅加载 VAE 权重和 latent 统计...")
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    source_state = checkpoint.get("state_dict", checkpoint)
+    current_state = model.state_dict()
+    allowed_prefixes = ("latent_encoder.", "latent_decoder.")
+    allowed_exact = {"z_mean", "z_std"}
+    filtered_state = {}
+    missing_source_keys = []
+    shape_mismatches = []
+    ignored_keys = []
+
+    for key, value in source_state.items():
+        is_vae_key = key.startswith(allowed_prefixes) or key in allowed_exact
+        if not is_vae_key:
+            ignored_keys.append(key)
+            continue
+        if key not in current_state:
+            missing_source_keys.append(key)
+            continue
+        if current_state[key].shape != value.shape:
+            shape_mismatches.append(f"{key}: checkpoint={tuple(value.shape)}, current={tuple(current_state[key].shape)}")
+            continue
+        filtered_state[key] = value
+
+    required_current_keys = [key for key in current_state if key.startswith(allowed_prefixes) or key in allowed_exact]
+    unloaded_required_keys = [key for key in required_current_keys if key not in filtered_state]
+
+    if shape_mismatches:
+        raise RuntimeError("VAE checkpoint 与当前 VAE 结构存在尺寸不匹配：\n" + "\n".join(shape_mismatches))
+    if missing_source_keys:
+        raise RuntimeError("checkpoint 中的 VAE 参数在当前模型中不存在：\n" + "\n".join(missing_source_keys))
+    if unloaded_required_keys:
+        raise RuntimeError("当前 VAE 中存在未从 checkpoint 加载的必要参数：\n" + "\n".join(unloaded_required_keys))
+
+    incompatible = model.load_state_dict(filtered_state, strict=False)
+    loaded_numel = sum(value.numel() for value in filtered_state.values())
+
+    print(f"✅ 成功加载 VAE tensor 数量：{len(filtered_state)}")
+    print(f"✅ 成功加载 VAE 参数量：{loaded_numel:,}")
+    print(f"✅ 忽略非 VAE tensor 数量：{len(ignored_keys)}")
+    print("✅ 旧 fm_decoder.* 已全部忽略")
+    print("✅ 当前新 fm_decoder 保持重新初始化")
+
+    if hasattr(model, "z_mean"):
+        print("✅ z_mean =", model.z_mean.detach().cpu())
+    if hasattr(model, "z_std"):
+        print("✅ z_std =", model.z_std.detach().cpu())
+
+    return incompatible
 if __name__ == "__main__":
-    pl.seed_everything(2030, workers=True)
+    pl.seed_everything(2026, workers=True)
     parser = ArgumentParser()
     parser.add_argument("--root", type=str, required=True)
     parser.add_argument("--latent_cache_dir", type=str, default=None)
@@ -22,7 +72,7 @@ if __name__ == "__main__":
     parser.add_argument("--val_batch_size", type=int, required=True)
     parser.add_argument("--test_batch_size", type=int, required=True)
     parser.add_argument("--shuffle", type=bool, default=True)
-    parser.add_argument("--num_workers", type=int, default=16)
+    parser.add_argument("--num_workers", type=int, default=14)
     parser.add_argument("--pin_memory", type=bool, default=True)
     parser.add_argument("--persistent_workers", type=bool, default=True)
     parser.add_argument("--train_raw_dir", type=str, default=None)
@@ -54,44 +104,7 @@ if __name__ == "__main__":
         else:
             print(f"🚀 [New Stage] 从 {args.ckpt_path} 加载兼容的预训练模型权重，新模块保持当前初始化...")
             checkpoint = torch.load(args.ckpt_path, map_location="cpu", weights_only=False)
-            state_dict = checkpoint.get("state_dict", checkpoint)
-            incompatible = model.load_state_dict(state_dict, strict=False)
-            missing_keys = list(incompatible.missing_keys)
-            unexpected_keys = list(incompatible.unexpected_keys)
-
-            allowed_missing_exact = {"latent_fm_loss.weights"}
-            allowed_missing_prefixes = ("latent_regressor.", "fm_decoder.to_vel.")
-            invalid_missing = [
-                key for key in missing_keys
-                if key not in allowed_missing_exact and not key.startswith(allowed_missing_prefixes)
-            ]
-
-            def is_allowed_unexpected(key):
-                if key.startswith("fm_decoder.to_vel."):
-                    return True
-                if key.startswith("fm_decoder.blocks."):
-                    return any(name in key for name in (".adaLN_seg.", ".seg_attn.", ".norm4."))
-                return False
-
-            allowed_unexpected = [key for key in unexpected_keys if is_allowed_unexpected(key)]
-            invalid_unexpected = [key for key in unexpected_keys if not is_allowed_unexpected(key)]
-
-            if invalid_missing:
-                raise RuntimeError(
-                    f"除新回归头、新速度头和固定 buffer 外，还有当前模型参数未加载：{invalid_missing}"
-                )
-            if invalid_unexpected:
-                raise RuntimeError(
-                    f"checkpoint 中存在未被允许的旧参数：{invalid_unexpected}"
-                )
-
-            print(f"✅ 成功加载兼容权重，忽略旧结构参数 {len(allowed_unexpected)} 个")
-            print("✅ 当前新速度头保持重新初始化")
-
-            if hasattr(model, "latent_fm_loss") and hasattr(model.latent_fm_loss, "weights"):
-                print("✅ latent_fm_loss.weights =", model.latent_fm_loss.weights.detach().cpu())
-
-            print(f"✅ 成功加载兼容权重，忽略旧 segment-attention 参数 {len(allowed_unexpected)} 个")
+            load_vae_weights(model=model,ckpt_path=args.ckpt_path)
             fit_ckpt_path = None
     if args.model_type == "qcnet_fm" and args.vae_only:
         monitor_metric = "val_vae_loss"
@@ -115,7 +128,7 @@ if __name__ == "__main__":
     )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
     trainer = pl.Trainer(
-        accumulate_grad_batches=1,
+        accumulate_grad_batches=2,
         precision="bf16-mixed",
         accelerator=args.accelerator,
         devices=args.devices,

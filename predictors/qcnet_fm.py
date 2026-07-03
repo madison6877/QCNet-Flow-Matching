@@ -294,8 +294,8 @@ class QCNetFM(pl.LightningModule):
 
         self.test_predictions = dict()
 
-        means =  [0.0444621741771698, -0.019938623532652855, -0.008124598301947117, -0.042931146919727325, -0.006348638329654932]
-        stds =  [0.6535577178001404, 1.1441980600357056, 0.8359677791595459, 0.5522066950798035, 0.7899162769317627]
+        means =  [ 0.0002, -0.0189, -0.0105,  0.0394,  0.0083]
+        stds =  [0.5341, 0.9854, 0.6526, 1.1099, 0.6366]
         if len(means) != self.latent_dim or len(stds) != self.latent_dim:
             raise ValueError(
                 "z_mean/z_std 的维数必须与 latent_dim 一致："
@@ -556,7 +556,7 @@ class QCNetFM(pl.LightningModule):
         x_t = (1 - t_exp) * x_0 + t_exp * z_target
 
         scene_enc = self.encoder(data)
-        v_theta, pinn_loss = self(data, scene_enc, x_t, t)  # [N_a, num_intents, latent_dim]
+        v_theta = self(data, scene_enc, x_t, t)  # [N_a, num_intents, latent_dim]
 
         # 🌟 修复 1：过滤掉 99% 不需要预测的背景车辆的垃圾梯度
         valid_mask = predict_mask.any(dim=-1)
@@ -569,7 +569,7 @@ class QCNetFM(pl.LightningModule):
 
         # 只对有效的车辆计算 Flow Matching Loss
         fm_loss, loss_dict = self.latent_fm_loss(v_theta_valid, z_target_valid, x_0_valid)
-        fm_loss = fm_loss + 1000.0 * pinn_loss
+        fm_loss = fm_loss
 
         aux_ade_m, aux_fde_m, aux_latent_rmse, num_aux_agents = (
             self._decoder_aware_trajectory_loss(
@@ -593,9 +593,6 @@ class QCNetFM(pl.LightningModule):
         self.log("train_decoder_aux_weighted", weighted_aux_ade + weighted_aux_fde, prog_bar=False, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1))
         self.log("train_decoder_aux_scale", torch.tensor(aux_scale, device=self.device), prog_bar=False, on_step=False, on_epoch=True, batch_size=1)
         self.log("train_total_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=int(valid_mask.sum()))
-        #self.log('train_pinn_loss', pinn_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
-        # for k_name, v_loss in loss_dict.items():
-        #     self.log(f'train_{k_name}', v_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0))
         
         return loss
 
@@ -852,7 +849,7 @@ class QCNetFM(pl.LightningModule):
             x_0 = x_0 * self.z_std.to(device=x_0.device, dtype=x_0.dtype)
             t_exp = t[:, None, None]
             x_t = (1 - t_exp) * x_0 + t_exp * z_target
-            v_theta, pinn_loss = self(data, scene_enc, x_t, t)
+            v_theta = self(data, scene_enc, x_t, t)
 
         # 🌟 修复 1：过滤掉 99% 不需要预测的背景车辆的垃圾梯度
         valid_mask = predict_mask.any(dim=-1)
@@ -865,7 +862,7 @@ class QCNetFM(pl.LightningModule):
 
         # 只对有效的车辆计算 Flow Matching Loss
         fm_loss, loss_dict = self.latent_fm_loss(v_theta_valid, z_target_valid, x_0_valid)
-        fm_loss = fm_loss + 1000.0 * pinn_loss
+        fm_loss = fm_loss
 
         aux_ade_m, aux_fde_m, aux_latent_rmse, num_aux_agents = (
             self._decoder_aware_trajectory_loss(
@@ -882,13 +879,10 @@ class QCNetFM(pl.LightningModule):
         self.log("val_decoder_center_ADE_m", aux_ade_m, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1), sync_dist=True,)
         self.log("val_decoder_center_FDE_m", aux_fde_m, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1), sync_dist=True)
         self.log("val_decoder_terminal_latent_RMSE", aux_latent_rmse, prog_bar=True, on_step=False, on_epoch=True, batch_size=max(num_aux_agents, 1), sync_dist=True)
-        #self.log('val_pinn_loss', pinn_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
-        # for k_name, v_loss in loss_dict.items():
-        #     self.log(f'val_{k_name}', v_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=target.size(0), sync_dist=True)
-
+       
         # Stage 1: stop here, only evaluate FM velocity field loss
         if not self.scorer_only :
-            if (self.current_epoch + 1) % 5 != 0:
+            if (self.current_epoch + 1) % 2 != 0:
                 return
 
         # Stage 2: additionally evaluate scorer loss and trajectory prediction metrics
@@ -1155,7 +1149,7 @@ class QCNetFM(pl.LightningModule):
         parser.add_argument('--T_max', type=int, default=64)
         parser.add_argument('--submission_dir', type=str, default='./')
         parser.add_argument('--submission_file_name', type=str, default='submission')
-        parser.add_argument("--decoder_aux_ade_weight", type=float, default=0.07)
+        parser.add_argument("--decoder_aux_ade_weight", type=float, default=0.0)
         parser.add_argument("--decoder_aux_fde_weight", type=float, default=0.0)
         parser.add_argument("--decoder_aux_warmup_epochs", type=int, default=5)
         parser.add_argument(
