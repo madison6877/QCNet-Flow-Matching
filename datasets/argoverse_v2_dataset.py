@@ -1,16 +1,3 @@
-# Copyright (c) 2023, Zikang Zhou. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import math
 import os
 import pickle
@@ -18,6 +5,7 @@ import shutil
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, Union
+from collections import OrderedDict
 from urllib import request
 
 import numpy as np
@@ -80,7 +68,10 @@ class ArgoverseV2Dataset(Dataset):
                  num_historical_steps: int = 50,
                  num_future_steps: int = 60,
                  predict_unseen_agents: bool = False,
-                 vector_repr: bool = True) -> None:
+                 vector_repr: bool = True,
+                 prototype_assignment_dir: Optional[str] = None,
+                 prototype_assignment_strict: bool = False,
+                 assignment_cache_size: int = 4) -> None:
         root = os.path.expanduser(os.path.normpath(root))
         if not os.path.isdir(root):
             os.makedirs(root)
@@ -130,6 +121,11 @@ class ArgoverseV2Dataset(Dataset):
         self.num_steps = num_historical_steps + num_future_steps
         self.predict_unseen_agents = predict_unseen_agents
         self.vector_repr = vector_repr
+        self.prototype_assignment_strict = prototype_assignment_strict
+        self.assignment_cache_size = max(int(assignment_cache_size), 1)
+        self.prototype_assignment_dir = self._resolve_assignment_dir(prototype_assignment_dir, split)
+        self._assignment_index: Optional[Dict[str, Tuple[Path, int]]] = None
+        self._assignment_shard_cache: "OrderedDict[Path, Dict[str, Any]]" = OrderedDict()
         self._url = f'https://s3.amazonaws.com/argoverse/datasets/av2/tars/motion-forecasting/{split}.tar'
         self._num_samples = {
             'train': 199707,
@@ -147,7 +143,8 @@ class ArgoverseV2Dataset(Dataset):
                              'NONE', 'UNKNOWN', 'CROSSWALK', 'CENTERLINE']
         self._point_sides = ['LEFT', 'RIGHT', 'CENTER']
         self._polygon_to_polygon_types = ['NONE', 'PRED', 'SUCC', 'LEFT', 'RIGHT']
-        super(ArgoverseV2Dataset, self).__init__(root=root, transform=transform, pre_transform=None, pre_filter=None)
+        self._runtime_transform = transform
+        super(ArgoverseV2Dataset, self).__init__(root=root, transform=None, pre_transform=None, pre_filter=None)
 
     @property
     def raw_dir(self) -> str:
@@ -517,12 +514,191 @@ class ArgoverseV2Dataset(Dataset):
 
         return map_data
 
+    @staticmethod
+    def _normalize_scenario_id(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 1:
+                return str(value.detach().cpu().item())
+            return str(value.detach().cpu().tolist())
+        return str(value)
+
+    def _resolve_assignment_dir(self, assignment_dir: Optional[str], split: str) -> Optional[Path]:
+        if assignment_dir is None or split == "test":
+            return None
+        base = Path(os.path.expanduser(os.path.normpath(assignment_dir)))
+        candidates = []
+        if base.name == split:
+            candidates.append(base)
+        candidates.append(base / split)
+        candidates.append(base)
+        for candidate in candidates:
+            if candidate.is_dir() and any(candidate.glob("shard_*.pt")):
+                return candidate
+        if self.prototype_assignment_strict:
+            raise FileNotFoundError(
+                f"未找到 {split} 的 prototype assignment shards：{assignment_dir}。"
+                "期望目录形如 <assignment_root>/<split>/shard_*.pt。"
+            )
+        return None
+
+    def _ensure_assignment_index(self) -> None:
+        if self.prototype_assignment_dir is None or self._assignment_index is not None:
+            return
+        index: Dict[str, Tuple[Path, int]] = {}
+        shard_paths = sorted(self.prototype_assignment_dir.glob("shard_*.pt"))
+        if not shard_paths and self.prototype_assignment_strict:
+            raise FileNotFoundError(f"目录中没有 shard_*.pt：{self.prototype_assignment_dir}")
+        for shard_path in shard_paths:
+            payload = torch.load(shard_path, map_location="cpu", weights_only=False)
+            scenes = payload.get("scenes", [])
+            for scene_idx, record in enumerate(scenes):
+                scenario_id = self._normalize_scenario_id(record.get("scenario_id"))
+                if scenario_id in index and self.prototype_assignment_strict:
+                    raise RuntimeError(f"重复的 scenario_id={scenario_id} 出现在 assignment shards 中。")
+                index[scenario_id] = (shard_path, scene_idx)
+        self._assignment_index = index
+
+    def _load_assignment_shard(self, shard_path: Path) -> Dict[str, Any]:
+        cached = self._assignment_shard_cache.get(shard_path)
+        if cached is not None:
+            self._assignment_shard_cache.move_to_end(shard_path)
+            return cached
+        payload = torch.load(shard_path, map_location="cpu", weights_only=False)
+        self._assignment_shard_cache[shard_path] = payload
+        while len(self._assignment_shard_cache) > self.assignment_cache_size:
+            self._assignment_shard_cache.popitem(last=False)
+        return payload
+
+    def _get_assignment_record(self, scenario_id: str) -> Optional[Dict[str, Any]]:
+        if self.prototype_assignment_dir is None:
+            return None
+        self._ensure_assignment_index()
+        assert self._assignment_index is not None
+        item = self._assignment_index.get(scenario_id)
+        if item is None:
+            if self.prototype_assignment_strict:
+                raise KeyError(
+                    f"scenario_id={scenario_id} 不在 prototype assignment index 中。"
+                    "请确认 assignment shards 与当前 split/processed_dir 一致。"
+                )
+            return None
+        shard_path, scene_idx = item
+        payload = self._load_assignment_shard(shard_path)
+        return payload["scenes"][scene_idx]
+
+    def _merge_prototype_assignment(self, data: HeteroData) -> HeteroData:
+        if self.prototype_assignment_dir is None:
+            return data
+        scenario_id = self._normalize_scenario_id(data["scenario_id"])
+        record = self._get_assignment_record(scenario_id)
+        if record is None:
+            return data
+        num_agents = int(data["agent"]["num_nodes"])
+        record_num_agents = int(record.get("num_agents", -1))
+        if record_num_agents != num_agents:
+            message = (
+                f"prototype assignment 的 num_agents 与原始 HeteroData 不一致："
+                f"scenario_id={scenario_id}, record={record_num_agents}, data={num_agents}。"
+                "这通常说明 processed 数据和 assignment shards 不是同一版本。"
+            )
+            if self.prototype_assignment_strict:
+                raise RuntimeError(message)
+            return data
+
+        # 只合并 tensor 字段。agent_id/track_id 等列表字段保留原始 HeteroData 中的 id 即可。
+        fields = (
+            "prototype_index",
+            "valid_agent_mask",
+            "match_latent_raw_l2",
+            "match_ade_m",
+            "match_fde_m",
+            "match_traj_score_m",
+            "z_gt_centered_raw",
+            "z_residual",
+        )
+        for key in fields:
+            if key not in record or record[key] is None:
+                if self.prototype_assignment_strict:
+                    raise KeyError(f"assignment record 缺少字段 {key}: scenario_id={scenario_id}")
+                continue
+            value = record[key]
+            if not isinstance(value, torch.Tensor):
+                if self.prototype_assignment_strict:
+                    raise TypeError(f"assignment 字段 {key} 不是 Tensor: {type(value)}")
+                continue
+            if value.size(0) != num_agents:
+                message = f"assignment 字段 {key} 第一维与 num_agents 不一致：{value.size(0)} vs {num_agents}"
+                if self.prototype_assignment_strict:
+                    raise RuntimeError(message)
+                continue
+            data["agent"][key] = value.clone()
+        return data
+
     def len(self) -> int:
         return self._num_samples
 
     def get(self, idx: int) -> HeteroData:
         with open(self.processed_paths[idx], 'rb') as handle:
-            return HeteroData(pickle.load(handle))
+            data = HeteroData(pickle.load(handle))
+
+        # 如果 assignment 已经被离线写入 processed pkl，
+        # 先临时保存，避免 TargetBuilder 把这些字段丢掉。
+        assignment_fields = (
+            "prototype_index",
+            "valid_agent_mask",
+            "match_latent_raw_l2",
+            "match_ade_m",
+            "match_fde_m",
+            "match_traj_score_m",
+            "z_gt_centered_raw",
+            "z_residual",
+        )
+
+        premerged_assignment = {}
+        if "agent" in data:
+            for key in assignment_fields:
+                if key in data["agent"]:
+                    value = data["agent"][key]
+                    if isinstance(value, torch.Tensor):
+                        premerged_assignment[key] = value
+
+        # 先执行 TargetBuilder
+        if self._runtime_transform is not None:
+            data = self._runtime_transform(data)
+
+        # 再把 pkl 里已经有的 assignment 字段补回去
+        if len(premerged_assignment) > 0:
+            num_agents = int(data["agent"]["num_nodes"])
+            for key, value in premerged_assignment.items():
+                if value.size(0) != num_agents:
+                    raise RuntimeError(
+                        f"premerged assignment 字段 {key} 第一维与 num_agents 不一致："
+                        f"{value.size(0)} vs {num_agents}, scenario_id={data['scenario_id']}"
+                    )
+                data["agent"][key] = value.clone()
+
+        # 如果还额外指定了 prototype_assignment_dir，则执行 runtime merge。
+        # 离线合并训练时通常不会走这里。
+        data = self._merge_prototype_assignment(data)
+
+        # 只要 residual 字段应该存在，就做最终检查。
+        if self.split in ("train", "val"):
+            has_any_assignment = any(k in data["agent"] for k in assignment_fields)
+            if self.prototype_assignment_dir is not None or has_any_assignment:
+                required = ("prototype_index", "z_residual", "z_gt_centered_raw")
+                missing = [k for k in required if k not in data["agent"]]
+                if missing:
+                    raise RuntimeError(
+                        f"[Dataset get] residual assignment 字段缺失：{missing}, "
+                        f"scenario_id={data['scenario_id']}, "
+                        f"assignment_dir={self.prototype_assignment_dir}"
+                    )
+
+        return data
 
     def _download(self) -> None:
         #if complete raw/processed files exist, skip downloading

@@ -8,7 +8,6 @@ import torch.multiprocessing
 
 from datamodules import ArgoverseV2DataModule
 from predictors import QCNet, QCNetFM
-from latent_regression_cache import make_latent_regression_loader
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 torch.set_float32_matmul_precision("high")
@@ -64,7 +63,7 @@ def load_vae_weights(model, ckpt_path):
 
     return incompatible
 if __name__ == "__main__":
-    pl.seed_everything(2026, workers=True)
+    pl.seed_everything(2030, workers=True)
     parser = ArgumentParser()
     parser.add_argument("--root", type=str, required=True)
     parser.add_argument("--latent_cache_dir", type=str, default=None)
@@ -87,6 +86,9 @@ if __name__ == "__main__":
     parser.add_argument("--model_type", type=str, choices=["qcnet", "qcnet_fm"], default="qcnet")
     parser.add_argument("--ckpt_path", type=str, default=None)
     parser.add_argument("--vae_processed_dir", type=str, default=None)
+    parser.add_argument("--prototype_assignment_dir", type=str, default=None)
+    parser.add_argument("--prototype_assignment_strict", action="store_true", default=False)
+    parser.add_argument("--assignment_cache_size", type=int, default=8)
     parser.add_argument("--resume", action="store_true", default=False)
 
     known_args, _ = parser.parse_known_args()
@@ -108,9 +110,6 @@ if __name__ == "__main__":
             fit_ckpt_path = None
     if args.model_type == "qcnet_fm" and args.vae_only:
         monitor_metric = "val_vae_loss"
-        monitor_mode = "min"
-    elif args.model_type == "qcnet_fm" and args.latent_regression_only:
-        monitor_metric = "val_latent_reg_loss"
         monitor_mode = "min"
     elif args.model_type == "qcnet_fm" and not args.scorer_only:
         monitor_metric = "val_fm_loss"
@@ -135,27 +134,8 @@ if __name__ == "__main__":
         callbacks=[model_checkpoint, lr_monitor],
         max_epochs=args.max_epochs,
     )
-
-    if args.model_type == "qcnet_fm" and args.latent_regression_only and args.latent_cache_dir is not None:
-        train_loader = make_latent_regression_loader(
-            cache_dir=args.latent_cache_dir,
-            split="train",
-            shuffle=True,
-            num_workers=min(args.num_workers, 4),
-        )
-        val_loader = make_latent_regression_loader(
-            cache_dir=args.latent_cache_dir,
-            split="val",
-            shuffle=False,
-            num_workers=min(args.num_workers, 4),
-        )
-        trainer.fit(
-            model,
-            train_dataloaders=train_loader,
-            val_dataloaders=val_loader,
-            ckpt_path=fit_ckpt_path,
-        )
-    elif args.model_type == "qcnet_fm" and args.vae_only:
+  
+    if args.model_type == "qcnet_fm" and args.vae_only:
         if args.vae_processed_dir is None:
             raise ValueError("--vae_processed_dir must be set when vae_only=True")
         print(f"⚡ [Stage 0] Preprocessing VAE data to {args.vae_processed_dir}...")
