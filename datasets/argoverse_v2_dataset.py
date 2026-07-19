@@ -610,15 +610,23 @@ class ArgoverseV2Dataset(Dataset):
             return data
 
         # 只合并 tensor 字段。agent_id/track_id 等列表字段保留原始 HeteroData 中的 id 即可。
-        fields = (
-            "prototype_index",
-            "valid_agent_mask",
-            "match_latent_raw_l2",
-            "match_ade_m",
-            "match_fde_m",
-            "match_traj_score_m",
-            "z_gt_centered_raw",
-            "z_residual",
+        fields=(
+            "coarse_index",
+"prototype_index",
+"secondary_prototype_index",
+"support_prototype_ids",
+"support_weights",
+"support_size",
+"boundary_margin",
+"is_boundary",
+"valid_agent_mask",
+"match_latent_raw_l2",
+"second_match_latent_raw_l2",
+"match_ade_m",
+"match_fde_m",
+"match_traj_score_m",
+"z_gt_centered_raw",
+"z_residual",
         )
         for key in fields:
             if key not in record or record[key] is None:

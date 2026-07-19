@@ -63,7 +63,7 @@ def load_vae_weights(model, ckpt_path):
 
     return incompatible
 if __name__ == "__main__":
-    pl.seed_everything(2030, workers=True)
+    pl.seed_everything(2027, workers=True)
     parser = ArgumentParser()
     parser.add_argument("--root", type=str, required=True)
     parser.add_argument("--latent_cache_dir", type=str, default=None)

@@ -106,12 +106,12 @@ class ArgoverseV2DataModule(pl.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.train_batch_size, shuffle=self.shuffle,
                           num_workers=self.num_workers, pin_memory=self.pin_memory,
-                          persistent_workers=self.persistent_workers, prefetch_factor=2)
+                          persistent_workers=self.persistent_workers, prefetch_factor=1)
 
     def val_dataloader(self):
         return DataLoader(self.val_dataset, batch_size=self.val_batch_size, shuffle=False,
                           num_workers=self.num_workers, pin_memory=self.pin_memory,
-                          persistent_workers=self.persistent_workers, prefetch_factor=2)
+                          persistent_workers=self.persistent_workers, prefetch_factor=1)
 
     def prepare_vae_data(self) -> None:
         """一次性后处理：从完整 .pkl 文件提取 VAE 所需的 target/mask 存为微型 .pt 文件。
@@ -155,11 +155,11 @@ class ArgoverseV2DataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=True,
             persistent_workers=self.persistent_workers,
-            prefetch_factor=4,
+            prefetch_factor=2,
             collate_fn=vae_collate_fn,
         )
 
     def test_dataloader(self):
         return DataLoader(self.test_dataset, batch_size=self.test_batch_size, shuffle=False,
                           num_workers=self.num_workers, pin_memory=self.pin_memory,
-                          persistent_workers=self.persistent_workers, prefetch_factor=2)
+                          persistent_workers=self.persistent_workers, prefetch_factor=1)

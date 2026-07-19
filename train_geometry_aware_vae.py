@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Standardized-latent geometry-aware VAE training with decoder calibration.
+Standardized-latent geometry-aware VAE training with a 3-layer decoder and decoder calibration.
 
 Pipeline
 --------
 A. Ordinary VAE warm-up.
 B. Joint encoder/decoder training. Geometry perturbations are applied in the
-   standardized posterior-mean latent space using online EMA statistics.
+   standardized posterior-mean latent space using online EMA statistics. The
+   global sensitivity anchor constrains E[log sensitivity].
 C. Select a joint checkpoint and recompute exact full-train-set latent stats.
 D. Freeze the encoder and calibrate decoder-side parameters with exact stats.
 E. Export independent best-total, best-reconstruction, best-geometry and last
@@ -46,28 +47,33 @@ torch.set_float32_matmul_precision("high")
 
 class FiniteDifferenceStandardizedGeometryLoss(nn.Module):
     def __init__(self, num_directions: int = 8, perturbation: float = 0.05, scale_weight: float = 0.1,
-                 output_dim: int = 2, eps: float = 1e-8) -> None:
+                 anchor_weight: float = 0.1, output_dim: int = 2, eps: float = 1e-8) -> None:
         super().__init__()
         if num_directions < 2:
             raise ValueError("num_directions must be at least 2.")
         if perturbation <= 0:
             raise ValueError("perturbation must be positive.")
-        if scale_weight < 0:
-            raise ValueError("scale_weight must be non-negative.")
+        if scale_weight < 0 or anchor_weight < 0:
+            raise ValueError("scale_weight and anchor_weight must be non-negative.")
         self.num_directions = int(num_directions)
         self.perturbation = float(perturbation)
         self.scale_weight = float(scale_weight)
+        self.anchor_weight = float(anchor_weight)
         self.output_dim = int(output_dim)
         self.eps = float(eps)
 
-    def forward(self, decoder_std: nn.Module, z_std: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, decoder_std: nn.Module, z_std: torch.Tensor,
+                target_log_sensitivity: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         if z_std.ndim != 3:
             raise ValueError(f"z_std must be [B, num_intents, latent_dim], got {tuple(z_std.shape)}.")
         batch_size, num_intents, latent_dim = z_std.shape
         if batch_size == 0:
             zero = z_std.sum() * 0.0
-            return {"loss": zero, "direction_loss": zero, "scale_loss": zero, "mean_sensitivity": zero,
-                    "min_sensitivity": zero, "max_sensitivity": zero}
+            return {"loss": zero, "direction_loss": zero, "scale_loss": zero, "anchor_loss": zero,
+                    "mean_sensitivity": zero, "log_mean_sensitivity": zero,
+                    "geometric_mean_sensitivity": zero, "mean_log_sensitivity": zero,
+                    "target_log_sensitivity": zero, "min_sensitivity": zero,
+                    "max_sensitivity": zero, "log_sensitivity_sum": zero, "num_sensitivity": zero}
         flat_dim = num_intents * latent_dim
         z_flat = z_std.reshape(batch_size, flat_dim)
         directions = torch.randn(batch_size, self.num_directions, flat_dim, device=z_std.device, dtype=z_std.dtype)
@@ -83,10 +89,25 @@ class FiniteDifferenceStandardizedGeometryLoss(nn.Module):
         log_sensitivity = torch.log(sensitivity.clamp_min(self.eps))
         direction_loss = log_sensitivity.var(dim=1, unbiased=False).mean()
         scale_loss = log_sensitivity.mean(dim=1).var(unbiased=False)
-        total_loss = direction_loss + self.scale_weight * scale_loss
+        mean_sensitivity = sensitivity.mean()
+        log_mean_sensitivity = torch.log(mean_sensitivity.clamp_min(self.eps))
+        mean_log_sensitivity = log_sensitivity.mean()
+        if target_log_sensitivity is None:
+            anchor_loss = mean_log_sensitivity * 0.0
+            target_value = mean_log_sensitivity.detach()
+        else:
+            target_value = target_log_sensitivity.to(device=mean_log_sensitivity.device,
+                                                     dtype=mean_log_sensitivity.dtype).detach()
+            anchor_loss = (mean_log_sensitivity - target_value).pow(2)
+        total_loss = direction_loss + self.scale_weight * scale_loss + self.anchor_weight * anchor_loss
         return {"loss": total_loss, "direction_loss": direction_loss, "scale_loss": scale_loss,
-                "mean_sensitivity": sensitivity.mean(), "min_sensitivity": sensitivity.min(),
-                "max_sensitivity": sensitivity.max()}
+                "anchor_loss": anchor_loss, "mean_sensitivity": mean_sensitivity,
+                "log_mean_sensitivity": log_mean_sensitivity,
+                "geometric_mean_sensitivity": mean_log_sensitivity.exp(),
+                "mean_log_sensitivity": mean_log_sensitivity, "target_log_sensitivity": target_value,
+                "min_sensitivity": sensitivity.min(), "max_sensitivity": sensitivity.max(),
+                "log_sensitivity_sum": log_sensitivity.sum(),
+                "num_sensitivity": sensitivity.new_tensor(float(sensitivity.numel()))}
 
 
 class StandardizedGeometryAwareQCNetFM(QCNetFM):
@@ -94,6 +115,8 @@ class StandardizedGeometryAwareQCNetFM(QCNetFM):
                  calibration_epochs: int = 5, geometry_weight: float = 0.01, geometry_warmup_epochs: int = 5,
                  geometry_num_agents: int = 8, geometry_num_directions: int = 8,
                  geometry_perturbation: float = 0.05, geometry_scale_weight: float = 0.1,
+                 geometry_anchor_weight: float = 0.1, geometry_anchor_init_batches: int = 1,
+                 geometry_detach_latent_center: bool = True,
                  latent_stats_momentum: float = 0.99, calibration_lr: float = 2e-5,
                  endpoint_loss_weight: float = 5.0, validation_geometry_seed: int = 1729, **kwargs) -> None:
         kwargs["vae_only"] = True
@@ -105,8 +128,10 @@ class StandardizedGeometryAwareQCNetFM(QCNetFM):
             raise ValueError("geometry_stage must be 'joint' or 'calibration'.")
         if not 0.0 <= latent_stats_momentum < 1.0:
             raise ValueError("latent_stats_momentum must be in [0, 1).")
-        if geometry_weight < 0 or endpoint_loss_weight < 0:
-            raise ValueError("geometry_weight and endpoint_loss_weight must be non-negative.")
+        if geometry_weight < 0 or geometry_anchor_weight < 0 or endpoint_loss_weight < 0:
+            raise ValueError("geometry_weight, geometry_anchor_weight and endpoint_loss_weight must be non-negative.")
+        if geometry_anchor_init_batches < 1:
+            raise ValueError("geometry_anchor_init_batches must be at least 1.")
         self.geometry_stage = geometry_stage
         self.pretrain_epochs = int(pretrain_epochs)
         self.joint_epochs = int(joint_epochs)
@@ -114,12 +139,16 @@ class StandardizedGeometryAwareQCNetFM(QCNetFM):
         self.geometry_weight = float(geometry_weight)
         self.geometry_warmup_epochs = int(geometry_warmup_epochs)
         self.geometry_num_agents = int(geometry_num_agents)
+        self.geometry_anchor_weight = float(geometry_anchor_weight)
+        self.geometry_anchor_init_batches = int(geometry_anchor_init_batches)
+        self.geometry_detach_latent_center = bool(geometry_detach_latent_center)
         self.latent_stats_momentum = float(latent_stats_momentum)
         self.calibration_lr = float(calibration_lr)
         self.endpoint_loss_weight = float(endpoint_loss_weight)
         self.validation_geometry_seed = int(validation_geometry_seed)
         self.geometry_loss_fn = FiniteDifferenceStandardizedGeometryLoss(
-            geometry_num_directions, geometry_perturbation, geometry_scale_weight, self.output_dim)
+            geometry_num_directions, geometry_perturbation, geometry_scale_weight,
+            geometry_anchor_weight, self.output_dim)
 
         stats_shape = (1, self.vae_num_intents, self.latent_dim)
         if tuple(self.z_mean.shape) != stats_shape:
@@ -133,6 +162,10 @@ class StandardizedGeometryAwareQCNetFM(QCNetFM):
             self.z_mean.zero_()
             self.z_std.fill_(1.0)
         self.register_buffer("z_second_moment", torch.ones(stats_shape), persistent=False)
+        self.register_buffer("geometry_log_sensitivity_target", torch.tensor(0.0))
+        self.register_buffer("geometry_anchor_log_sensitivity_sum", torch.tensor(0.0))
+        self.register_buffer("geometry_anchor_sample_count", torch.tensor(0.0))
+        self.register_buffer("geometry_anchor_batches_seen", torch.tensor(0, dtype=torch.long))
         self.z_stats_initialized = False
         self._set_trainable_parameters()
         self.save_hyperparameters({"geometry_stage": geometry_stage, "pretrain_epochs": pretrain_epochs,
@@ -142,11 +175,15 @@ class StandardizedGeometryAwareQCNetFM(QCNetFM):
                                    "geometry_num_directions": geometry_num_directions,
                                    "geometry_perturbation": geometry_perturbation,
                                    "geometry_scale_weight": geometry_scale_weight,
+                                   "geometry_anchor_weight": geometry_anchor_weight,
+                                   "geometry_anchor_init_batches": geometry_anchor_init_batches,
+                                   "geometry_detach_latent_center": geometry_detach_latent_center,
                                    "latent_stats_momentum": latent_stats_momentum,
                                    "calibration_lr": calibration_lr,
                                    "endpoint_loss_weight": endpoint_loss_weight,
                                    "validation_geometry_seed": validation_geometry_seed,
                                    "geometry_space": "standardized",
+                                   "geometry_anchor_type": "expected_log_sensitivity",
                                    "uses_decoder_calibration": True})
 
     def _set_trainable_parameters(self) -> None:
@@ -170,6 +207,10 @@ class StandardizedGeometryAwareQCNetFM(QCNetFM):
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         checkpoint["geometry_ema_second_moment"] = self.z_second_moment.detach().cpu()
         checkpoint["geometry_stats_initialized"] = bool(self.z_stats_initialized)
+        checkpoint["geometry_anchor_initialized"] = bool(self._geometry_anchor_initialized())
+        checkpoint["geometry_anchor_target_log_sensitivity"] = float(
+            self.geometry_log_sensitivity_target.detach().cpu().item())
+        checkpoint["geometry_anchor_type"] = "expected_log_sensitivity"
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
         second = checkpoint.get("geometry_ema_second_moment")
@@ -239,6 +280,29 @@ class StandardizedGeometryAwareQCNetFM(QCNetFM):
         variance = (self.z_second_moment - self.z_mean.pow(2)).clamp_min(1e-4)
         self.z_std.copy_(variance.sqrt())
 
+    def _geometry_anchor_initialized(self) -> bool:
+        return int(self.geometry_anchor_batches_seen.item()) >= self.geometry_anchor_init_batches
+
+    @torch.no_grad()
+    def _update_geometry_anchor(self, log_sensitivity_sum: torch.Tensor,
+                                num_sensitivity: torch.Tensor) -> None:
+        batch_sum = log_sensitivity_sum.detach().float().reshape(())
+        batch_count = num_sensitivity.detach().float().reshape(())
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(batch_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(batch_count, op=dist.ReduceOp.SUM)
+        if batch_count.item() <= 0:
+            return
+        self.geometry_anchor_log_sensitivity_sum.add_(
+            batch_sum.to(self.geometry_anchor_log_sensitivity_sum))
+        self.geometry_anchor_sample_count.add_(batch_count.to(self.geometry_anchor_sample_count))
+        self.geometry_anchor_batches_seen.add_(1)
+        if self._geometry_anchor_initialized():
+            target_mean_log = (self.geometry_anchor_log_sensitivity_sum /
+                               self.geometry_anchor_sample_count.clamp_min(1.0))
+            self.geometry_log_sensitivity_target.copy_(
+                target_mean_log.to(self.geometry_log_sensitivity_target))
+
     def _geometry_scale(self) -> float:
         if self.geometry_stage == "calibration":
             return 1.0
@@ -252,6 +316,8 @@ class StandardizedGeometryAwareQCNetFM(QCNetFM):
     def _select_geometry_agents(self, predict_mask: torch.Tensor, random_selection: bool) -> torch.Tensor:
         candidates = torch.where(predict_mask.all(dim=-1))[0]
         if candidates.numel() == 0:
+            return candidates
+        if self.geometry_num_agents <= 0:
             return candidates
         count = min(self.geometry_num_agents, candidates.numel())
         if random_selection:
@@ -269,11 +335,16 @@ class StandardizedGeometryAwareQCNetFM(QCNetFM):
 
     def _empty_geometry_result(self, reference: torch.Tensor) -> Dict[str, torch.Tensor]:
         zero = reference.sum() * 0.0
-        return {"loss": zero, "direction_loss": zero, "scale_loss": zero, "mean_sensitivity": zero,
-                "min_sensitivity": zero, "max_sensitivity": zero}
+        return {"loss": zero, "direction_loss": zero, "scale_loss": zero, "anchor_loss": zero,
+                "mean_sensitivity": zero, "log_mean_sensitivity": zero,
+                "geometric_mean_sensitivity": zero, "mean_log_sensitivity": zero,
+                "target_log_sensitivity": self.geometry_log_sensitivity_target.detach().to(reference),
+                "anchor_initialized": zero, "min_sensitivity": zero, "max_sensitivity": zero,
+                "log_sensitivity_sum": zero, "num_sensitivity": zero}
 
     def _compute_geometry(self, mu_std: torch.Tensor, predict_mask: torch.Tensor, random_selection: bool,
-                          deterministic_seed: Optional[int] = None) -> Tuple[Dict[str, torch.Tensor], int]:
+                          deterministic_seed: Optional[int] = None,
+                          update_anchor: bool = False) -> Tuple[Dict[str, torch.Tensor], int]:
         selected = self._select_geometry_agents(predict_mask, random_selection)
         if selected.numel() == 0:
             return self._empty_geometry_result(mu_std), 0
@@ -289,7 +360,19 @@ class StandardizedGeometryAwareQCNetFM(QCNetFM):
                 if mu_std.is_cuda:
                     torch.cuda.manual_seed_all(deterministic_seed)
             with self._geometry_context():
-                result = self.geometry_loss_fn(self._decode_standardized, mu_std[selected].float())
+                anchor_target = (self.geometry_log_sensitivity_target.detach()
+                                 if self._geometry_anchor_initialized() else None)
+                geometry_center = mu_std[selected]
+                if self.geometry_detach_latent_center:
+                    geometry_center = geometry_center.detach()
+                result = self.geometry_loss_fn(
+                    self._decode_standardized, geometry_center.float(), anchor_target)
+        if update_anchor and self.geometry_anchor_weight > 0.0 and not self._geometry_anchor_initialized():
+            self._update_geometry_anchor(result["log_sensitivity_sum"], result["num_sensitivity"])
+        result["target_log_sensitivity"] = self.geometry_log_sensitivity_target.detach().to(
+            device=result["mean_log_sensitivity"].device, dtype=result["mean_log_sensitivity"].dtype)
+        result["anchor_initialized"] = result["mean_log_sensitivity"].new_tensor(
+            float(self._geometry_anchor_initialized()))
         if was_training and self.geometry_stage == "joint":
             self.latent_encoder.train()
         return result, int(selected.numel())
@@ -323,7 +406,8 @@ class StandardizedGeometryAwareQCNetFM(QCNetFM):
         base_loss = native_loss + weighted_endpoint
         geometry_scale = self._geometry_scale()
         if geometry_scale > 0.0:
-            geometry_result, num_geometry = self._compute_geometry(mu_std, predict_mask, True)
+            geometry_result, num_geometry = self._compute_geometry(
+                mu_std, predict_mask, True, update_anchor=True)
         else:
             geometry_result, num_geometry = self._empty_geometry_result(base_loss), 0
         weighted_geometry = geometry_scale * self.geometry_weight * geometry_result["loss"]
@@ -346,7 +430,21 @@ class StandardizedGeometryAwareQCNetFM(QCNetFM):
         self.log("train_geo_loss", geometry_result["loss"], prog_bar=True, on_step=False, on_epoch=True, batch_size=geo_count)
         self.log("train_geo_direction", geometry_result["direction_loss"], on_step=False, on_epoch=True, batch_size=geo_count)
         self.log("train_geo_location_scale", geometry_result["scale_loss"], on_step=False, on_epoch=True, batch_size=geo_count)
+        self.log("train_geo_anchor", geometry_result["anchor_loss"], prog_bar=True, on_step=False, on_epoch=True, batch_size=geo_count)
         self.log("train_geo_mean_sensitivity", geometry_result["mean_sensitivity"], on_step=False, on_epoch=True, batch_size=geo_count)
+        self.log("train_geo_log_mean_sensitivity", geometry_result["log_mean_sensitivity"],
+                 on_step=False, on_epoch=True, batch_size=geo_count)
+        self.log("train_geo_geometric_mean_sensitivity", geometry_result["geometric_mean_sensitivity"],
+                 on_step=False, on_epoch=True, batch_size=geo_count)
+        self.log("train_geo_mean_log_sensitivity", geometry_result["mean_log_sensitivity"],
+                 on_step=False, on_epoch=True, batch_size=geo_count)
+        self.log("train_geo_target_log_sensitivity", geometry_result["target_log_sensitivity"],
+                 on_step=False, on_epoch=True, batch_size=geo_count)
+        self.log("train_geo_anchor_initialized", geometry_result["anchor_initialized"],
+                 on_step=False, on_epoch=True, batch_size=1)
+        self.log("train_geo_latent_center_detached",
+                 total_loss.new_tensor(float(self.geometry_detach_latent_center)),
+                 on_step=False, on_epoch=True, batch_size=1)
         self.log("train_geo_min_sensitivity", geometry_result["min_sensitivity"], on_step=False, on_epoch=True, batch_size=geo_count)
         self.log("train_geo_max_sensitivity", geometry_result["max_sensitivity"], on_step=False, on_epoch=True, batch_size=geo_count)
         self.log("train_geo_weighted", weighted_geometry, prog_bar=True, on_step=False, on_epoch=True, batch_size=geo_count)
@@ -397,6 +495,18 @@ class StandardizedGeometryAwareQCNetFM(QCNetFM):
         self.log("val_geo_loss", geometry_result["loss"], prog_bar=True, on_step=False, on_epoch=True, batch_size=geo_count, sync_dist=True)
         self.log("val_geo_direction", geometry_result["direction_loss"], on_step=False, on_epoch=True, batch_size=geo_count, sync_dist=True)
         self.log("val_geo_location_scale", geometry_result["scale_loss"], on_step=False, on_epoch=True, batch_size=geo_count, sync_dist=True)
+        self.log("val_geo_anchor", geometry_result["anchor_loss"], on_step=False, on_epoch=True, batch_size=geo_count, sync_dist=True)
+        self.log("val_geo_mean_sensitivity", geometry_result["mean_sensitivity"], on_step=False, on_epoch=True, batch_size=geo_count, sync_dist=True)
+        self.log("val_geo_log_mean_sensitivity", geometry_result["log_mean_sensitivity"],
+                 on_step=False, on_epoch=True, batch_size=geo_count, sync_dist=True)
+        self.log("val_geo_geometric_mean_sensitivity", geometry_result["geometric_mean_sensitivity"],
+                 on_step=False, on_epoch=True, batch_size=geo_count, sync_dist=True)
+        self.log("val_geo_mean_log_sensitivity", geometry_result["mean_log_sensitivity"],
+                 on_step=False, on_epoch=True, batch_size=geo_count, sync_dist=True)
+        self.log("val_geo_target_log_sensitivity", geometry_result["target_log_sensitivity"],
+                 on_step=False, on_epoch=True, batch_size=geo_count, sync_dist=True)
+        self.log("val_geo_anchor_initialized", geometry_result["anchor_initialized"],
+                 on_step=False, on_epoch=True, batch_size=1, sync_dist=True)
         self.log("val_geo_weighted", weighted_geometry, on_step=False, on_epoch=True, batch_size=geo_count, sync_dist=True)
 
     def configure_optimizers(self):
@@ -431,7 +541,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shuffle", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num_workers", type=int, default=14)
     parser.add_argument("--pin_memory", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--persistent_workers", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--persistent_workers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--train_raw_dir", type=str, default=None)
     parser.add_argument("--val_raw_dir", type=str, default=None)
     parser.add_argument("--test_raw_dir", type=str, default=None)
@@ -442,10 +552,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--accelerator", type=str, default="auto")
     parser.add_argument("--devices", type=int, default=1)
     parser.add_argument("--precision", type=str, default="bf16-mixed")
-    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--seed", type=int, default=2030)
     parser.add_argument("--output_dir", type=str, default="./geometry_standardized_vae_runs")
     parser.add_argument("--init_ckpt", type=str, default=None, help="Warm-start weights only.")
-    parser.add_argument("--resume_joint_ckpt", type=str, default=None, help="Resume complete joint-stage Lightning state.")
+    parser.add_argument("--resume_joint_ckpt", type=str, default=None,
+                        help="Resume joint epoch/step, VAE parameters, optimizer and scheduler state while replacing incompatible frozen non-VAE modules with current initialization.")
     parser.add_argument("--skip_prepare_vae_data", action="store_true", default=False)
     parser.add_argument("--force_prepare_vae_data", action="store_true", default=False)
     parser.add_argument("--pretrain_epochs", type=int, default=12)
@@ -453,10 +564,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calibration_epochs", type=int, default=5)
     parser.add_argument("--geometry_weight", type=float, default=0.01)
     parser.add_argument("--geometry_warmup_epochs", type=int, default=5)
-    parser.add_argument("--geometry_num_agents", type=int, default=8)
-    parser.add_argument("--geometry_num_directions", type=int, default=8)
+    parser.add_argument("--geometry_num_agents", type=int, default=84)
+    parser.add_argument("--geometry_num_directions", type=int, default=20)
     parser.add_argument("--geometry_perturbation", type=float, default=0.05)
     parser.add_argument("--geometry_scale_weight", type=float, default=0.1)
+    parser.add_argument("--geometry_anchor_weight", type=float, default=0.1,
+                        help="Weight inside geometry loss for fixing E[log(sensitivity)], the global log-Jacobian-energy scale.")
+    parser.add_argument("--geometry_anchor_init_batches", type=int, default=4,
+                        help="Number of first geometry-training batches used to set the fixed sensitivity target.")
+    parser.add_argument("--geometry_detach_latent_center", action=argparse.BooleanOptionalAction, default=True,
+                        help="Detach posterior-mean latent centers before geometry decoding so geometry gradients update the decoder, not the encoder.")
     parser.add_argument("--latent_stats_momentum", type=float, default=0.99)
     parser.add_argument("--calibration_lr", type=float, default=2e-5)
     parser.add_argument("--endpoint_loss_weight", type=float, default=5.0,
@@ -469,7 +586,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stats_device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--stats_log_interval", type=int, default=200)
     QCNetFM.add_model_specific_args(parser)
+    parser.set_defaults(num_dec_layers=2)
     args = parser.parse_args()
+    args.num_dec_layers = 2
     if args.init_ckpt and args.resume_joint_ckpt:
         parser.error("--init_ckpt and --resume_joint_ckpt cannot be used together.")
     if args.skip_prepare_vae_data and args.force_prepare_vae_data:
@@ -498,13 +617,109 @@ def _load_checkpoint(path: str | Path) -> Dict[str, Any]:
         return torch.load(path, map_location="cpu")
 
 
+def prepare_partial_vae_resume_checkpoint(model: nn.Module, checkpoint_path: str | Path,
+                                          output_path: Path) -> str:
+    """Create a Lightning checkpoint that resumes VAE optimization but ignores frozen architecture changes.
+
+    The original optimizer/scheduler/loop state is preserved. The model state is
+    rebuilt on the current model definition: every compatible tensor is copied
+    from the checkpoint, while incompatible ``fm_decoder.*`` tensors and other
+    frozen-module differences use the current initialization. All VAE tensors
+    must exist with identical shapes, otherwise optimizer-state restoration would
+    be unsafe and the function raises.
+    """
+    checkpoint = _load_checkpoint(checkpoint_path)
+    old_state = checkpoint.get("state_dict")
+    if not isinstance(old_state, dict):
+        raise RuntimeError(f"Resume checkpoint has no Lightning state_dict: {checkpoint_path}")
+    current_state = model.state_dict()
+    merged_state: Dict[str, torch.Tensor] = {}
+    copied, reset_fm, reset_other, ignored_old = [], [], [], []
+
+    vae_prefixes = ("latent_encoder.", "latent_decoder.")
+    missing_vae = []
+    mismatched_vae = []
+    for key, current_value in current_state.items():
+        old_value = old_state.get(key)
+        if old_value is not None and tuple(old_value.shape) == tuple(current_value.shape):
+            merged_state[key] = old_value.detach().cpu()
+            copied.append(key)
+            continue
+        merged_state[key] = current_value.detach().cpu().clone()
+        if key.startswith(vae_prefixes):
+            if old_value is None:
+                missing_vae.append(key)
+            else:
+                mismatched_vae.append((key, tuple(old_value.shape), tuple(current_value.shape)))
+        elif key.startswith("fm_decoder."):
+            reset_fm.append(key)
+        else:
+            reset_other.append(key)
+
+    ignored_old = sorted(key for key in old_state if key not in current_state)
+    if missing_vae or mismatched_vae:
+        raise RuntimeError(
+            "Cannot restore the old optimizer safely because the VAE parameter structure changed. "
+            f"missing VAE keys={missing_vae[:20]}, mismatched VAE keys={mismatched_vae[:20]}"
+        )
+
+    optimizer_states = checkpoint.get("optimizer_states", [])
+    if not optimizer_states:
+        raise RuntimeError("Resume checkpoint contains no optimizer_states.")
+    trainable_count = sum(1 for parameter in model.parameters() if parameter.requires_grad)
+    checkpoint_param_count = sum(
+        len(group.get("params", []))
+        for group in optimizer_states[0].get("param_groups", [])
+    )
+    if checkpoint_param_count != trainable_count:
+        raise RuntimeError(
+            "Optimizer parameter count does not match the current trainable VAE. "
+            f"checkpoint={checkpoint_param_count}, current={trainable_count}. "
+            "The VAE architecture or trainable-parameter selection changed."
+        )
+
+    checkpoint["state_dict"] = merged_state
+    # Start new ModelCheckpoint bookkeeping in the new output directory while
+    # retaining optimizer, scheduler, epoch, global step and loop progress.
+    checkpoint.pop("callbacks", None)
+    checkpoint.setdefault("partial_resume_metadata", {}).update({
+        "source_checkpoint": str(Path(checkpoint_path).expanduser().resolve()),
+        "resume_scope": "VAE parameters + optimizer/scheduler + trainer loop state",
+        "copied_compatible_tensors": len(copied),
+        "reset_fm_decoder_tensors": len(reset_fm),
+        "reset_other_frozen_tensors": len(reset_other),
+        "ignored_old_tensors": len(ignored_old),
+    })
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(checkpoint, output_path)
+    print(f"[Partial Resume] source: {Path(checkpoint_path).expanduser().resolve()}")
+    print(f"[Partial Resume] sanitized checkpoint: {output_path.resolve()}")
+    print(f"[Partial Resume] copied compatible tensors: {len(copied):,}")
+    print(f"[Partial Resume] reset current fm_decoder tensors: {len(reset_fm):,}")
+    print(f"[Partial Resume] reset other frozen/current-only tensors: {len(reset_other):,}")
+    print(f"[Partial Resume] ignored checkpoint-only tensors: {len(ignored_old):,}")
+    print(f"[Partial Resume] optimizer parameter tensors: {checkpoint_param_count:,}")
+    return str(output_path.resolve())
+
+
 def load_initial_weights(model: nn.Module, checkpoint_path: Optional[str]) -> None:
     if checkpoint_path is None:
         return
     checkpoint = _load_checkpoint(checkpoint_path)
-    state_dict = checkpoint.get("state_dict", checkpoint)
+    state_dict = dict(checkpoint.get("state_dict", checkpoint))
+    reset_anchor_keys = (
+        "geometry_log_sensitivity_target", "geometry_anchor_log_sensitivity_sum",
+        "geometry_anchor_sensitivity_sum", "geometry_anchor_sample_count",
+        "geometry_anchor_batches_seen")
+    removed_anchor_keys = [key for key in reset_anchor_keys if state_dict.pop(key, None) is not None]
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"[Init] loaded weights from: {checkpoint_path}")
+    if hasattr(model, "geometry_log_sensitivity_target"):
+        model.geometry_log_sensitivity_target.zero_()
+        model.geometry_anchor_log_sensitivity_sum.zero_()
+        model.geometry_anchor_sample_count.zero_()
+        model.geometry_anchor_batches_seen.zero_()
+    print(f"[Init] loaded compatible weights from: {checkpoint_path}")
+    print(f"[Init] reset E[log sensitivity] anchor state; removed keys: {removed_anchor_keys}")
     print(f"[Init] missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
 
 
@@ -635,6 +850,7 @@ def export_vae_weights(checkpoint_path: str, output_path: Path, metadata: Dict[s
 def main() -> None:
     args = parse_args()
     pl.seed_everything(args.seed, workers=True)
+    print(f"[Config] num_dec_layers={args.num_dec_layers}, geometry anchor=E[log sensitivity]")
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     datamodule = ArgoverseV2DataModule(**vars(args))
@@ -645,14 +861,19 @@ def main() -> None:
 
     print("\n========== Stage A+B: warm-up + standardized-geometry joint training ==========")
     joint_model = StandardizedGeometryAwareQCNetFM(**build_model_kwargs(args, "joint"))
+    resume_ckpt_path = None
     if args.resume_joint_ckpt is None:
         load_initial_weights(joint_model, args.init_ckpt)
+    else:
+        resume_ckpt_path = prepare_partial_vae_resume_checkpoint(
+            joint_model, args.resume_joint_ckpt,
+            output_dir / "_partial_resume" / "vae_optimizer_resume.ckpt")
     joint_resume, joint_total, joint_recon, joint_geo = make_stage_callbacks(
         output_dir / "joint", args.joint_save_top_k)
     joint_trainer = build_trainer(args, "joint", args.pretrain_epochs + args.joint_epochs,
                                   [joint_resume, joint_total, joint_recon, joint_geo])
     joint_trainer.fit(joint_model, train_dataloaders=train_loader, val_dataloaders=val_loader,
-                      ckpt_path=args.resume_joint_ckpt)
+                      ckpt_path=resume_ckpt_path)
     if not joint_trainer.is_global_zero:
         return
     joint_selected = select_checkpoint(args.joint_selection, joint_total, joint_recon, joint_geo, joint_resume)
@@ -664,13 +885,28 @@ def main() -> None:
     exact_mean, exact_std, count = compute_exact_latent_stats(
         joint_model, train_loader, torch.device(args.stats_device), args.stats_log_interval)
     stats_path = output_dir / "exact_latent_stats.json"
-    stats_path.write_text(json.dumps({"geometry_space": "standardized", "num_valid_agents": count,
-                                      "mean": exact_mean.tolist(), "std": exact_std.tolist()},
+    anchor_initialized = bool(joint_model._geometry_anchor_initialized())
+    anchor_target_log = float(joint_model.geometry_log_sensitivity_target.detach().cpu().item())
+    anchor_target_geometric_mean_sensitivity = float(torch.exp(
+        joint_model.geometry_log_sensitivity_target.detach().cpu()).item())
+    stats_path.write_text(json.dumps({"geometry_space": "standardized",
+                                      "geometry_anchor_type": "expected_log_sensitivity",
+                                      "num_dec_layers": int(args.num_dec_layers),
+                                      "num_valid_agents": count,
+                                      "mean": exact_mean.tolist(), "std": exact_std.tolist(),
+                                      "geometry_anchor_initialized": anchor_initialized,
+                                      "geometry_anchor_target_log_sensitivity": anchor_target_log,
+                                      "geometry_anchor_target_geometric_mean_sensitivity": anchor_target_geometric_mean_sensitivity},
                                      indent=2, ensure_ascii=False), encoding="utf-8")
     joint_payload["state_dict"] = {k: v.detach().cpu() for k, v in joint_model.state_dict().items()}
     joint_payload.setdefault("geometry_metadata", {}).update({
         "geometry_space": "standardized", "uses_decoder_calibration": True,
+        "geometry_anchor_type": "expected_log_sensitivity",
+        "num_dec_layers": int(args.num_dec_layers),
         "joint_selection": args.joint_selection, "source_checkpoint": str(Path(joint_selected).resolve()),
+        "geometry_anchor_initialized": anchor_initialized,
+        "geometry_anchor_target_log_sensitivity": anchor_target_log,
+        "geometry_anchor_target_geometric_mean_sensitivity": anchor_target_geometric_mean_sensitivity,
         "exact_latent_statistics": {"num_valid_agents": count, "mean": exact_mean.tolist(),
                                     "std": exact_std.tolist()}})
     joint_exact_path = output_dir / "joint_selected_with_exact_stats.ckpt"
@@ -707,7 +943,14 @@ def main() -> None:
     alias_paths: Dict[str, Optional[str]] = {}
     weight_paths: Dict[str, Optional[str]] = {}
     metadata = {"geometry_space": "standardized", "uses_decoder_calibration": True,
-                "endpoint_loss_weight": float(args.endpoint_loss_weight)}
+                "num_dec_layers": int(args.num_dec_layers),
+                "geometry_anchor_type": "expected_log_sensitivity",
+                "geometry_detach_latent_center": bool(args.geometry_detach_latent_center),
+                "endpoint_loss_weight": float(args.endpoint_loss_weight),
+                "geometry_anchor_weight": float(args.geometry_anchor_weight),
+                "geometry_anchor_initialized": anchor_initialized,
+                "geometry_anchor_target_log_sensitivity": anchor_target_log,
+                "geometry_anchor_target_geometric_mean_sensitivity": anchor_target_geometric_mean_sensitivity}
     for label, (source, destination) in aliases.items():
         if source:
             shutil.copy2(source, destination)
@@ -723,13 +966,21 @@ def main() -> None:
     export_vae_weights(final_source, default_weights, metadata)
 
     manifest = {
-        "pipeline": "standardized geometry joint training + exact statistics + frozen-encoder decoder calibration",
+        "pipeline": "3-layer decoder + E[log sensitivity] geometry joint training + exact statistics + frozen-encoder decoder calibration",
         "geometry_space": "standardized", "uses_decoder_calibration": True,
+        "num_dec_layers": int(args.num_dec_layers),
+        "geometry_anchor_type": "expected_log_sensitivity",
         "joint_selection": args.joint_selection, "joint_selected_checkpoint": str(Path(joint_selected).resolve()),
         "joint_exact_checkpoint": str(joint_exact_path.resolve()),
         "final_selection": args.final_selection, "formal_final_checkpoint": str(final_path.resolve()),
         "default_vae_only_weights": str(default_weights.resolve()), "latent_statistics": str(stats_path.resolve()),
         "endpoint_loss_weight": float(args.endpoint_loss_weight), "geometry_weight": float(args.geometry_weight),
+        "geometry_detach_latent_center": bool(args.geometry_detach_latent_center),
+        "geometry_anchor_weight": float(args.geometry_anchor_weight),
+        "geometry_anchor_init_batches": int(args.geometry_anchor_init_batches),
+        "geometry_anchor_initialized": anchor_initialized,
+        "geometry_anchor_target_log_sensitivity": anchor_target_log,
+        "geometry_anchor_target_geometric_mean_sensitivity": anchor_target_geometric_mean_sensitivity,
         "joint": {"best_total": {"score": checkpoint_score(joint_total), "path": joint_total.best_model_path},
                   "best_reconstruction": {"score": checkpoint_score(joint_recon), "path": joint_recon.best_model_path},
                   "best_geometry": {"score": checkpoint_score(joint_geo), "path": joint_geo.best_model_path},
