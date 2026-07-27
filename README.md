@@ -1,5 +1,3 @@
-# QCNet Structured Latent Residual Flow Matching
-
 本项目在 QCNet 场景编码器之上，将未来轨迹的生成过程放到 VAE 潜空间中完成。与直接从高斯噪声生成完整 latent 不同，本项目先建立离散的 prototype 库，再由场景条件 selector 选择合适的 prototype，最后使用残差中心头和 flow matching 速度场补全 prototype 无法表达的连续变化。
 
 本文档以当前仓库代码为准，核心实现位于：
@@ -89,7 +87,7 @@ z_{\mathrm{std}}=(z_{\mathrm{raw}}-\mu_z)/\sigma_z,
 因此，最终 assignment 规则不是在所有 prototype 中直接全局最近邻，而是：
 
 ```math
-g_i = \operatorname{NearestCoarse}(d_i),
+g_i = \mathrm{NearestCoarse}(d_i),
 ```
 
 ```math
@@ -143,7 +141,7 @@ c_\psi=C_\psi(S,p).
 速度场不直接生成完整残差，而是学习：
 
 ```math
-\delta=r-\operatorname{stopgrad}(c_\psi).
+\delta=r-\mathrm{stopgrad}(c_\psi).
 ```
 
 中心头通过独立的 MSE 训练：
